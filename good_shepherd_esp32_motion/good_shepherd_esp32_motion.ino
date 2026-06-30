@@ -277,7 +277,7 @@ void setup() {
   setLed(false);
 
   Serial.println();
-  Serial.println("Good Shepherd ESP32 Motion v1.6.5 Identify LED");
+  Serial.println("Good Shepherd ESP32 Motion v1.6.6");
 
   generateHardwareIds();
   ensureSetupId();
@@ -773,7 +773,6 @@ void performFirmwareUpdate(String commandId, String firmwareUrl) {
   logSensor("Firmware update requested.");
   logSensor("Firmware URL: " + firmwareUrl);
 
-  reportCommandResult(commandId, "running", "ESP32 firmware update started.");
 
   WiFiClientSecure client;
   client.setInsecure();
