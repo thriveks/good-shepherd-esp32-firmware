@@ -35,7 +35,7 @@ const char* HEARTBEAT_URL = "https://good-shepherd-server-j06f.onrender.com/node
 const char* LATEST_FIRMWARE_URL = "https://good-shepherd-server-j06f.onrender.com/firmware/latest";
 const char* WEBHOOK_SECRET = "7e9c767aa079423227163be90943d7d2";
 
-const char* SOFTWARE_VERSION = "esp32-motion-v1.7.5-ota-proof";
+const char* SOFTWARE_VERSION = "esp32-motion-v1.7.6-ota-stability";
 
 const char* BLE_SERVICE_UUID = "7d9f0001-2f4f-4c3a-8b2a-0b5f7f2a0001";
 const char* BLE_STATUS_UUID  = "7d9f0002-2f4f-4c3a-8b2a-0b5f7f2a0001";
@@ -95,6 +95,9 @@ void pollSensorCommands();
 void reportCommandResult(String commandId, String status, String message);
 bool checkLatestFirmwareStatusOnly();
 void performFirmwareUpdate(String commandId, String firmwareUrl);
+void stopBleForFirmwareUpdate();
+void finishFirmwareUpdateFailure(String commandId, String message);
+String httpErrorDescription(HTTPClient& http, int responseCode);
 void handleBleCommand(String payload);
 void handleMotionSensor();
 void sendMotionEvent();
@@ -653,7 +656,7 @@ void setup() {
   setLed(false);
 
   Serial.println();
-  Serial.println("Good Shepherd ESP32 Motion v1.7.3");
+  Serial.println("Good Shepherd ESP32 Motion v1.7.6 OTA stability");
 
   generateHardwareIds();
   ensureSetupId();
@@ -1249,10 +1252,64 @@ bool checkLatestFirmwareStatusOnly() {
   return true;
 }
 
+String httpErrorDescription(HTTPClient& http, int responseCode) {
+  if (responseCode > 0) {
+    return "HTTP " + String(responseCode);
+  }
+
+  return "HTTP " + String(responseCode) + " (" + http.errorToString(responseCode) + ")";
+}
+
+void stopBleForFirmwareUpdate() {
+  if (!bleStarted) {
+    return;
+  }
+
+  Serial.println(sensorLabel() + " | Stopping BLE before OTA to free heap and radio resources.");
+
+  if (bleResultCharacteristic != nullptr && bleClientConnected) {
+    bleResultCharacteristic->setValue("{\"status\":\"running\",\"message\":\"Firmware update starting. BLE will disconnect during download.\"}");
+    bleResultCharacteristic->notify();
+    delay(350);
+  }
+
+  BLEDevice::stopAdvertising();
+  delay(250);
+  BLEDevice::deinit(true);
+  delay(1000);
+
+  bleServer = nullptr;
+  bleStatusCharacteristic = nullptr;
+  bleCommandCharacteristic = nullptr;
+  bleResultCharacteristic = nullptr;
+  bleStarted = false;
+  bleClientConnected = false;
+
+  Serial.print(sensorLabel() + " | Free heap after BLE stop: ");
+  Serial.println(ESP.getFreeHeap());
+}
+
+void finishFirmwareUpdateFailure(String commandId, String message) {
+  Serial.println(sensorLabel() + " | " + message);
+
+  firmwareUpdateInProgress = false;
+
+  if (commandId.length() > 0) {
+    reportCommandResult(commandId, "failed", message);
+  }
+
+  if (!bleStarted) {
+    startBleManagement();
+    delay(500);
+  }
+
+  publishBleResult("failed", message);
+  updateBleStatus();
+}
+
 void performFirmwareUpdate(String commandId, String firmwareUrl) {
   if (WiFi.status() != WL_CONNECTED) {
-    if (commandId.length() > 0) reportCommandResult(commandId, "failed", "Firmware update failed: Wi-Fi is offline.");
-    publishBleResult("failed", "Firmware update failed: Wi-Fi offline.");
+    finishFirmwareUpdateFailure(commandId, "Firmware update failed: Wi-Fi offline.");
     return;
   }
 
@@ -1261,34 +1318,61 @@ void performFirmwareUpdate(String commandId, String firmwareUrl) {
   logSensor("Firmware update requested.");
   logSensor("Firmware URL: " + firmwareUrl);
 
+  Serial.print(sensorLabel() + " | Free heap before OTA prep: ");
+  Serial.println(ESP.getFreeHeap());
+
+  if (setupModeStarted) {
+    server.close();
+    WiFi.softAPdisconnect(true);
+    setupModeStarted = false;
+    delay(250);
+  } else {
+    server.close();
+    delay(100);
+  }
+
+  stopBleForFirmwareUpdate();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  delay(750);
+
+  if (WiFi.status() != WL_CONNECTED) {
+    finishFirmwareUpdateFailure(commandId, "Firmware update failed: Wi-Fi disconnected before download.");
+    return;
+  }
+
+  Serial.print(sensorLabel() + " | Free heap before HTTPS begin: ");
+  Serial.println(ESP.getFreeHeap());
+
   WiFiClientSecure client;
   client.setInsecure();
+  client.setTimeout(120000);
 
   HTTPClient http;
-  http.setTimeout(120000);
+  http.setTimeout(180000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.setReuse(false);
 
   if (!http.begin(client, firmwareUrl)) {
-    firmwareUpdateInProgress = false;
-
-    if (commandId.length() > 0) reportCommandResult(commandId, "failed", "Firmware update failed: could not open firmware URL.");
-    publishBleResult("failed", "Firmware update failed: could not open firmware URL.");
+    finishFirmwareUpdateFailure(commandId, "Firmware update failed: could not open firmware URL.");
     return;
   }
 
+  http.addHeader("User-Agent", "GoodShepherd-ESP32-OTA/1.7.6");
+
   int responseCode = http.GET();
 
+  Serial.print(sensorLabel() + " | Firmware HTTP response: ");
+  Serial.println(httpErrorDescription(http, responseCode));
+
   if (responseCode != HTTP_CODE_OK) {
-    String message = "Firmware update failed: download returned HTTP " + String(responseCode) + ".";
+    String message = "Firmware update failed: download returned " + httpErrorDescription(http, responseCode) + ".";
 
     http.end();
     client.stop();
 
-    firmwareUpdateInProgress = false;
-
-    if (commandId.length() > 0) reportCommandResult(commandId, "failed", message);
-    publishBleResult("failed", message);
+    finishFirmwareUpdateFailure(commandId, message);
     return;
   }
 
@@ -1298,15 +1382,15 @@ void performFirmwareUpdate(String commandId, String firmwareUrl) {
     http.end();
     client.stop();
 
-    firmwareUpdateInProgress = false;
-
-    if (commandId.length() > 0) reportCommandResult(commandId, "failed", "Firmware update failed: firmware file was empty.");
-    publishBleResult("failed", "Firmware update failed: firmware file was empty.");
+    finishFirmwareUpdateFailure(commandId, "Firmware update failed: firmware file was empty.");
     return;
   }
 
   Serial.print(sensorLabel() + " | Firmware size: ");
   Serial.println(contentLength);
+
+  Serial.print(sensorLabel() + " | Free heap before Update.begin: ");
+  Serial.println(ESP.getFreeHeap());
 
   bool canBegin = contentLength > 0 ? Update.begin(contentLength) : Update.begin(UPDATE_SIZE_UNKNOWN);
 
@@ -1316,10 +1400,7 @@ void performFirmwareUpdate(String commandId, String firmwareUrl) {
     http.end();
     client.stop();
 
-    firmwareUpdateInProgress = false;
-
-    if (commandId.length() > 0) reportCommandResult(commandId, "failed", message);
-    publishBleResult("failed", message);
+    finishFirmwareUpdateFailure(commandId, message);
     return;
   }
 
@@ -1337,10 +1418,7 @@ void performFirmwareUpdate(String commandId, String firmwareUrl) {
     http.end();
     client.stop();
 
-    firmwareUpdateInProgress = false;
-
-    if (commandId.length() > 0) reportCommandResult(commandId, "failed", message);
-    publishBleResult("failed", message);
+    finishFirmwareUpdateFailure(commandId, message);
     return;
   }
 
@@ -1350,10 +1428,7 @@ void performFirmwareUpdate(String commandId, String firmwareUrl) {
     http.end();
     client.stop();
 
-    firmwareUpdateInProgress = false;
-
-    if (commandId.length() > 0) reportCommandResult(commandId, "failed", message);
-    publishBleResult("failed", message);
+    finishFirmwareUpdateFailure(commandId, message);
     return;
   }
 
@@ -1361,10 +1436,7 @@ void performFirmwareUpdate(String commandId, String firmwareUrl) {
     http.end();
     client.stop();
 
-    firmwareUpdateInProgress = false;
-
-    if (commandId.length() > 0) reportCommandResult(commandId, "failed", "Firmware update failed: update did not finish.");
-    publishBleResult("failed", "Firmware update failed: update did not finish.");
+    finishFirmwareUpdateFailure(commandId, "Firmware update failed: update did not finish.");
     return;
   }
 
@@ -1372,11 +1444,10 @@ void performFirmwareUpdate(String commandId, String firmwareUrl) {
   client.stop();
 
   if (commandId.length() > 0) reportCommandResult(commandId, "success", "Firmware update installed. ESP32 rebooting.");
-  publishBleResult("success", "Firmware update installed. ESP32 rebooting.");
 
   Serial.println(sensorLabel() + " | Firmware update complete. Rebooting...");
 
-  delay(2000);
+  delay(1500);
   ESP.restart();
 }
 
