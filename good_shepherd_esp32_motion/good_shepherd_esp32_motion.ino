@@ -35,7 +35,7 @@ const char* HEARTBEAT_URL = "https://good-shepherd-server-j06f.onrender.com/node
 const char* LATEST_FIRMWARE_URL = "https://good-shepherd-server-j06f.onrender.com/firmware/latest";
 const char* WEBHOOK_SECRET = "7e9c767aa079423227163be90943d7d2";
 
-const char* SOFTWARE_VERSION = "esp32-motion-v1.7.3-ble-status-compact";
+const char* SOFTWARE_VERSION = "esp32-motion-v1.7.4-ble-status-min";
 
 const char* BLE_SERVICE_UUID = "7d9f0001-2f4f-4c3a-8b2a-0b5f7f2a0001";
 const char* BLE_STATUS_UUID  = "7d9f0002-2f4f-4c3a-8b2a-0b5f7f2a0001";
@@ -406,8 +406,10 @@ String buildBleStatusPayload() {
     rssi = WiFi.RSSI();
   }
 
-  // Keep this compact. iOS currently reads/decodes this characteristic as one JSON value.
-  // Detailed Wi-Fi diagnostics are sent through BLE result messages, not status JSON.
+  // v1.7.4: keep the BLE status payload intentionally small.
+  // iOS reads this characteristic as one JSON value. Longer real-world names/SSIDs can
+  // push the old payload past practical BLE characteristic limits and cause truncated JSON.
+  // Detailed diagnostics stay in BLE result messages and server heartbeat payloads.
   String payload = "{";
   payload += "\"nodeId\":\"" + jsonEscape(nodeId) + "\",";
   payload += "\"sourceKey\":\"" + jsonEscape(sourceKey) + "\",";
@@ -415,19 +417,16 @@ String buildBleStatusPayload() {
   payload += "\"deviceName\":\"" + jsonEscape(deviceName) + "\",";
   payload += "\"roomName\":\"" + jsonEscape(roomName) + "\",";
   payload += "\"residentName\":\"" + jsonEscape(residentName) + "\",";
-  payload += "\"locationName\":\"" + jsonEscape(locationName) + "\",";
-  payload += "\"assignmentState\":\"" + jsonEscape(assignmentState()) + "\",";
   payload += "\"softwareVersion\":\"" + jsonEscape(String(SOFTWARE_VERSION)) + "\",";
   payload += "\"wifiStatus\":\"" + jsonEscape(wifiStatus) + "\",";
   payload += "\"wifiSsid\":\"" + jsonEscape(ssid) + "\",";
-  payload += "\"savedWifiName\":\"" + jsonEscape(wifiName) + "\",";
   payload += "\"localIp\":\"" + jsonEscape(ip) + "\",";
   payload += "\"wifiRssi\":" + String(rssi) + ",";
-  payload += "\"setupModeStarted\":" + String(setupModeStarted ? "true" : "false") + ",";
-  payload += "\"nodeRegistered\":" + String(nodeRegistered ? "true" : "false") + ",";
-  payload += "\"firmwareUpdateInProgress\":" + String(firmwareUpdateInProgress ? "true" : "false") + ",";
   payload += "\"uptimeSeconds\":" + String(millis() / 1000);
   payload += "}";
+
+  Serial.print(sensorLabel() + " | BLE status bytes: ");
+  Serial.println(payload.length());
 
   return payload;
 }
