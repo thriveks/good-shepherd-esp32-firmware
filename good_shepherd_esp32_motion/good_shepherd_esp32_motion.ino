@@ -35,7 +35,7 @@ const char* HEARTBEAT_URL = "https://good-shepherd-server-j06f.onrender.com/node
 const char* LATEST_FIRMWARE_URL = "https://good-shepherd-server-j06f.onrender.com/firmware/latest";
 const char* WEBHOOK_SECRET = "7e9c767aa079423227163be90943d7d2";
 
-const char* SOFTWARE_VERSION = "esp32-motion-v1.7.8-all-units-ota-proof";
+const char* SOFTWARE_VERSION = "esp32-motion-v1.7.9-self-healing";
 
 const char* BLE_SERVICE_UUID = "7d9f0001-2f4f-4c3a-8b2a-0b5f7f2a0001";
 const char* BLE_STATUS_UUID  = "7d9f0002-2f4f-4c3a-8b2a-0b5f7f2a0001";
@@ -73,6 +73,14 @@ unsigned long lastRegistrationAttemptTime = 0;
 unsigned long lastBleStatusUpdateTime = 0;
 unsigned long lastFirmwareStatusCheckTime = 0;
 unsigned long wifiConnectStartedAt = 0;
+unsigned long lastServerSuccessTime = 0;
+unsigned long lastServerFailureTime = 0;
+unsigned long lastSelfHealCheckTime = 0;
+unsigned long lastMotionWebhookAttemptTime = 0;
+unsigned long lastMotionWebhookSuccessTime = 0;
+unsigned long motionHeldActiveStartedAt = 0;
+
+int consecutiveServerFailureCount = 0;
 
 const unsigned long RESET_AFTER_NO_MOTION_MS = 10000;
 const unsigned long HEARTBEAT_INTERVAL_MS = 60000;
@@ -81,6 +89,13 @@ const unsigned long COMMAND_POLL_INTERVAL_MS = 15000;
 const unsigned long REGISTRATION_RETRY_INTERVAL_MS = 15000;
 const unsigned long BLE_STATUS_INTERVAL_MS = 2000;
 const unsigned long FIRMWARE_STATUS_CHECK_COOLDOWN_MS = 300000;
+const unsigned long HTTP_TIMEOUT_MS = 10000;
+const unsigned long SELF_HEAL_CHECK_INTERVAL_MS = 30000;
+const unsigned long SERVER_SILENCE_REBOOT_MS = 1800000;
+const unsigned long MOTION_RETRY_INTERVAL_MS = 15000;
+const unsigned long MOTION_HELD_ACTIVE_RESET_MS = 300000;
+const int SERVER_FAILURE_RECONNECT_THRESHOLD = 5;
+const int SERVER_FAILURE_REBOOT_THRESHOLD = 20;
 const int MAX_SAVED_WIFI = 8;
 
 // MARK: - Forward declarations
@@ -100,7 +115,11 @@ void finishFirmwareUpdateFailure(String commandId, String message);
 String httpErrorDescription(HTTPClient& http, int responseCode);
 void handleBleCommand(String payload);
 void handleMotionSensor();
-void sendMotionEvent();
+bool sendMotionEvent();
+void markServerSuccess(String context);
+void markServerFailure(String context, int responseCode);
+void reconnectWifiNow(String reason);
+void handleSelfHealing();
 void handleRoot();
 void handleSave();
 void handleReset();
@@ -425,7 +444,9 @@ String buildBleStatusPayload() {
   payload += "\"wifiSsid\":\"" + jsonEscape(ssid) + "\",";
   payload += "\"localIp\":\"" + jsonEscape(ip) + "\",";
   payload += "\"wifiRssi\":" + String(rssi) + ",";
-  payload += "\"uptimeSeconds\":" + String(millis() / 1000);
+  payload += "\"uptimeSeconds\":" + String(millis() / 1000) + ",";
+  payload += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
+  payload += "\"serverFailures\":" + String(consecutiveServerFailureCount);
   payload += "}";
 
   Serial.print(sensorLabel() + " | BLE status bytes: ");
@@ -644,6 +665,84 @@ void clearSettingsAndRestart() {
   ESP.restart();
 }
 
+void markServerSuccess(String context) {
+  lastServerSuccessTime = millis();
+  consecutiveServerFailureCount = 0;
+  lastWifiFailureReason = "";
+
+  if (WiFi.status() == WL_CONNECTED) {
+    lastConnectedIp = WiFi.localIP().toString();
+    lastConnectedSsid = WiFi.SSID();
+    lastWifiStatusText = "Wi-Fi connected: " + lastConnectedSsid + " / " + lastConnectedIp;
+  }
+
+  Serial.println(sensorLabel() + " | Server success: " + context);
+}
+
+void markServerFailure(String context, int responseCode) {
+  lastServerFailureTime = millis();
+  consecutiveServerFailureCount++;
+
+  String responseText = responseCode == 0 ? "no_response" : String(responseCode);
+  lastWifiFailureReason = context + " failed. Response: " + responseText + ". Failure count: " + String(consecutiveServerFailureCount);
+  lastWifiStatusText = lastWifiFailureReason;
+
+  Serial.println(sensorLabel() + " | " + lastWifiFailureReason);
+}
+
+void reconnectWifiNow(String reason) {
+  if (wifiName.length() == 0 || wifiPassword.length() == 0 || firmwareUpdateInProgress || wifiConnectInProgress) {
+    return;
+  }
+
+  Serial.println(sensorLabel() + " | Self-heal Wi-Fi reconnect: " + reason);
+  lastWifiStatusText = "Self-heal reconnect: " + reason;
+  nodeRegistered = false;
+
+  WiFi.disconnect(false);
+  delay(250);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(wifiName.c_str(), wifiPassword.c_str());
+
+  lastReconnectAttempt = millis();
+  updateBleStatus();
+}
+
+void handleSelfHealing() {
+  if (setupModeStarted || firmwareUpdateInProgress || wifiName.length() == 0) {
+    return;
+  }
+
+  if (millis() - lastSelfHealCheckTime < SELF_HEAL_CHECK_INTERVAL_MS) {
+    return;
+  }
+
+  lastSelfHealCheckTime = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    reconnectWifiNow("Wi-Fi is disconnected");
+    return;
+  }
+
+  if (consecutiveServerFailureCount >= SERVER_FAILURE_REBOOT_THRESHOLD) {
+    Serial.println(sensorLabel() + " | Rebooting after repeated server failures.");
+    delay(500);
+    ESP.restart();
+  }
+
+  if (consecutiveServerFailureCount >= SERVER_FAILURE_RECONNECT_THRESHOLD) {
+    reconnectWifiNow("server failures reached " + String(consecutiveServerFailureCount));
+    return;
+  }
+
+  if (lastServerSuccessTime > 0 && millis() - lastServerSuccessTime >= SERVER_SILENCE_REBOOT_MS) {
+    Serial.println(sensorLabel() + " | Rebooting after prolonged server silence.");
+    delay(500);
+    ESP.restart();
+  }
+}
+
 // MARK: - Arduino
 
 void setup() {
@@ -656,12 +755,14 @@ void setup() {
   setLed(false);
 
   Serial.println();
-  Serial.println("Good Shepherd ESP32 Motion v1.7.6 OTA stability");
+  Serial.println("Good Shepherd ESP32 Motion v1.7.9 self-healing");
 
   generateHardwareIds();
   ensureSetupId();
   loadSettings();
   startBleManagement();
+
+  lastServerSuccessTime = millis();
 
   if (wifiName.length() > 0) {
     connectToSavedWifi();
@@ -688,6 +789,7 @@ void loop() {
   }
 
   handleWifiReconnect();
+  handleSelfHealing();
 
   if (pendingFirmwareStatusCheck && WiFi.status() == WL_CONNECTED) {
     pendingFirmwareStatusCheck = false;
@@ -951,7 +1053,7 @@ bool registerNode() {
   client.setInsecure();
 
   HTTPClient http;
-  http.setTimeout(30000);
+  http.setTimeout(HTTP_TIMEOUT_MS);
   http.setReuse(false);
   http.begin(client, REGISTER_URL);
   http.addHeader("Content-Type", "application/json");
@@ -979,7 +1081,13 @@ bool registerNode() {
   client.stop();
   delay(50);
 
-  return responseCode >= 200 && responseCode < 300;
+  if (responseCode >= 200 && responseCode < 300) {
+    markServerSuccess("registerNode");
+    return true;
+  }
+
+  markServerFailure("registerNode", responseCode);
+  return false;
 }
 
 bool sendHeartbeat() {
@@ -991,7 +1099,7 @@ bool sendHeartbeat() {
   client.setInsecure();
 
   HTTPClient http;
-  http.setTimeout(30000);
+  http.setTimeout(HTTP_TIMEOUT_MS);
   http.setReuse(false);
   http.begin(client, HEARTBEAT_URL);
   http.addHeader("Content-Type", "application/json");
@@ -1010,6 +1118,7 @@ bool sendHeartbeat() {
   payload += "\"setupId\":\"" + setupId + "\",";
   payload += "\"assignmentState\":\"" + assignmentState() + "\",";
   payload += "\"uptimeSeconds\":" + String(millis() / 1000) + ",";
+  payload += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
   payload += "\"softwareVersion\":\"" + String(SOFTWARE_VERSION) + "\",";
   payload += "\"firmwareUpdateInProgress\":" + String(firmwareUpdateInProgress ? "true" : "false") + ",";
   payload += "\"bleManagement\":\"Enabled\",";
@@ -1030,6 +1139,9 @@ bool sendHeartbeat() {
   payload += "\"locationName\":\"" + jsonEscape(locationName) + "\",";
   payload += "\"wifiRssi\":" + String(WiFi.RSSI()) + ",";
   payload += "\"localIp\":\"" + WiFi.localIP().toString() + "\",";
+  payload += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
+  payload += "\"serverFailureCount\":" + String(consecutiveServerFailureCount) + ",";
+  payload += "\"lastMotionWebhookSuccessSeconds\":" + String(lastMotionWebhookSuccessTime == 0 ? 0 : (lastMotionWebhookSuccessTime / 1000)) + ",";
   payload += "\"wifiStatus\":\"connected\",";
   payload += "\"bleManagement\":\"Enabled\",";
   payload += "\"autoFirmwareInstallOnBoot\":false";
@@ -1045,6 +1157,7 @@ bool sendHeartbeat() {
   delay(50);
 
   if (responseCode >= 200 && responseCode < 300) {
+    markServerSuccess("sendHeartbeat");
     lastConnectedIp = WiFi.localIP().toString();
     lastConnectedSsid = WiFi.SSID();
     lastWifiStatusText = "Wi-Fi connected: " + lastConnectedSsid + " / " + lastConnectedIp;
@@ -1052,6 +1165,7 @@ bool sendHeartbeat() {
     return true;
   }
 
+  markServerFailure("sendHeartbeat", responseCode);
   return false;
 }
 
@@ -1066,7 +1180,7 @@ void pollSensorCommands() {
   client.setInsecure();
 
   HTTPClient http;
-  http.setTimeout(30000);
+  http.setTimeout(HTTP_TIMEOUT_MS);
   http.setReuse(false);
   http.begin(client, url);
   http.addHeader("x-webhook-secret", WEBHOOK_SECRET);
@@ -1076,6 +1190,7 @@ void pollSensorCommands() {
   if (responseCode != 200) {
     Serial.print(sensorLabel() + " | Command poll response code: ");
     Serial.println(responseCode);
+    markServerFailure("pollSensorCommands", responseCode);
     http.end();
     client.stop();
     delay(50);
@@ -1083,6 +1198,7 @@ void pollSensorCommands() {
   }
 
   String response = http.getString();
+  markServerSuccess("pollSensorCommands");
 
   http.end();
   client.stop();
@@ -1164,7 +1280,7 @@ void reportCommandResult(String commandId, String status, String message) {
   client.setInsecure();
 
   HTTPClient http;
-  http.setTimeout(30000);
+  http.setTimeout(HTTP_TIMEOUT_MS);
   http.setReuse(false);
   http.begin(client, url);
   http.addHeader("Content-Type", "application/json");
@@ -1183,6 +1299,12 @@ void reportCommandResult(String commandId, String status, String message) {
 
   Serial.print(sensorLabel() + " | Command result response code: ");
   Serial.println(responseCode);
+
+  if (responseCode >= 200 && responseCode < 300) {
+    markServerSuccess("reportCommandResult");
+  } else {
+    markServerFailure("reportCommandResult", responseCode);
+  }
 
   http.end();
   client.stop();
@@ -1203,7 +1325,7 @@ bool checkLatestFirmwareStatusOnly() {
   client.setInsecure();
 
   HTTPClient http;
-  http.setTimeout(30000);
+  http.setTimeout(HTTP_TIMEOUT_MS);
   http.setReuse(false);
 
   if (!http.begin(client, LATEST_FIRMWARE_URL)) {
@@ -1554,11 +1676,31 @@ void handleMotionSensor() {
     logSensor("PIR changed to " + String(motion));
   }
 
+  if (motion == MOTION_ACTIVE_STATE) {
+    if (motionHeldActiveStartedAt == 0) {
+      motionHeldActiveStartedAt = millis();
+    } else if (motionAlreadyReported && millis() - motionHeldActiveStartedAt >= MOTION_HELD_ACTIVE_RESET_MS) {
+      logSensor("Motion held active too long. Resetting reported state so future activity is not suppressed.");
+      motionAlreadyReported = false;
+      motionHeldActiveStartedAt = millis();
+    }
+  } else {
+    motionHeldActiveStartedAt = 0;
+  }
+
   if (motion == MOTION_ACTIVE_STATE && !motionAlreadyReported) {
-    logSensor("Motion detected. Sending webhook...");
-    sendMotionEvent();
-    motionAlreadyReported = true;
-    lastNoMotionTime = 0;
+    if (lastMotionWebhookAttemptTime == 0 || millis() - lastMotionWebhookAttemptTime >= MOTION_RETRY_INTERVAL_MS) {
+      lastMotionWebhookAttemptTime = millis();
+      logSensor("Motion detected. Sending webhook...");
+
+      if (sendMotionEvent()) {
+        motionAlreadyReported = true;
+        lastMotionWebhookSuccessTime = millis();
+        lastNoMotionTime = 0;
+      } else {
+        logSensor("Motion webhook failed. Will retry while motion remains active.");
+      }
+    }
   }
 
   if (motion != MOTION_ACTIVE_STATE && motionAlreadyReported) {
@@ -1578,10 +1720,11 @@ void handleMotionSensor() {
   }
 }
 
-void sendMotionEvent() {
+bool sendMotionEvent() {
   if (WiFi.status() != WL_CONNECTED) {
     logSensor("Wi-Fi offline. Motion event skipped.");
-    return;
+    markServerFailure("sendMotionEvent_offline", 0);
+    return false;
   }
 
   generateHardwareIds();
@@ -1590,7 +1733,7 @@ void sendMotionEvent() {
   client.setInsecure();
 
   HTTPClient http;
-  http.setTimeout(30000);
+  http.setTimeout(HTTP_TIMEOUT_MS);
   http.setReuse(false);
   http.begin(client, WEBHOOK_URL);
   http.addHeader("Content-Type", "application/json");
@@ -1618,6 +1761,14 @@ void sendMotionEvent() {
   http.end();
   client.stop();
   delay(50);
+
+  if (responseCode >= 200 && responseCode < 300) {
+    markServerSuccess("sendMotionEvent");
+    return true;
+  }
+
+  markServerFailure("sendMotionEvent", responseCode);
+  return false;
 }
 
 // MARK: - Fallback Web Setup
