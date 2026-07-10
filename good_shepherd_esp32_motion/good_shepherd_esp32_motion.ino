@@ -1,7 +1,7 @@
 /*
   Good Shepherd ESP32 Multi-Sensor Firmware
-  Version: esp32-good-shepherd-v1.8.4-priority-events-best-effort-telemetry
-  Date: 2026-07-09
+  Version: esp32-good-shepherd-v1.8.6-registration-first-ble-safe
+  Date: 2026-07-10
 
   Supported sensor modes:
     motion            = PIR motion sensor on GPIO27
@@ -25,6 +25,7 @@
     - v1.8.4 keeps presence_detected and presence_cleared as priority events.
     - v1.8.4 makes presence_telemetry best-effort so radar samples do not overload HTTPS.
     - v1.8.4 slows telemetry and prevents telemetry failures from driving self-heal resets.
+    - v1.8.5 keeps Wi-Fi/setup logic unchanged and only compacts BLE status for Human Presence setup stability.
 */
 
 #include <WiFi.h>
@@ -74,7 +75,7 @@ const char* HEARTBEAT_URL = "https://good-shepherd-server-j06f.onrender.com/node
 const char* LATEST_FIRMWARE_URL = "https://good-shepherd-server-j06f.onrender.com/firmware/latest";
 const char* WEBHOOK_SECRET = "7e9c767aa079423227163be90943d7d2";
 
-const char* SOFTWARE_VERSION = "esp32-good-shepherd-v1.8.4-priority-events-best-effort-telemetry";
+const char* SOFTWARE_VERSION = "esp32-good-shepherd-v1.8.6-registration-first-ble-safe";
 
 const char* BLE_SERVICE_UUID = "7d9f0001-2f4f-4c3a-8b2a-0b5f7f2a0001";
 const char* BLE_STATUS_UUID  = "7d9f0002-2f4f-4c3a-8b2a-0b5f7f2a0001";
@@ -159,7 +160,7 @@ const unsigned long HEARTBEAT_INTERVAL_MS = 60000;
 const unsigned long RECONNECT_INTERVAL_MS = 10000;
 const unsigned long COMMAND_POLL_INTERVAL_MS = 15000;
 const unsigned long REGISTRATION_RETRY_INTERVAL_MS = 15000;
-const unsigned long BLE_STATUS_INTERVAL_MS = 2000;
+const unsigned long BLE_STATUS_INTERVAL_MS = 5000;
 const unsigned long FIRMWARE_STATUS_CHECK_COOLDOWN_MS = 300000;
 const unsigned long HTTP_TIMEOUT_MS = 10000;
 const unsigned long TELEMETRY_HTTP_TIMEOUT_MS = 4500;
@@ -203,6 +204,7 @@ void startLd2410Uart();
 void handleLd2410Radar();
 void markServerSuccess(String context);
 void markServerFailure(String context, int responseCode);
+void markSetupCloudFailure(String context, int responseCode);
 void markTelemetryFailure(String context, int responseCode);
 void markTelemetrySuccess(String context);
 bool networkHealthyForTelemetry();
@@ -560,12 +562,8 @@ String buildBleStatusPayload() {
   payload += "\"wifiRssi\":" + String(rssi) + ",";
   payload += "\"motionState\":" + String(motionState == MOTION_ACTIVE_STATE ? "true" : "false") + ",";
   payload += "\"presenceState\":" + String(presenceState == PRESENCE_ACTIVE_STATE ? "true" : "false") + ",";
-  payload += "\"radarPresence\":" + String(radarPresence ? "true" : "false") + ",";
-  payload += "\"radarMovingDistanceCm\":" + String(radarMovingDistanceCm) + ",";
-  payload += "\"radarStationaryDistanceCm\":" + String(radarStationaryDistanceCm) + ",";
-  payload += "\"radarDetectionDistanceCm\":" + String(radarDetectionDistanceCm) + ",";
-  payload += "\"radarMovingEnergy\":" + String(radarMovingEnergy) + ",";
-  payload += "\"radarStationaryEnergy\":" + String(radarStationaryEnergy) + ",";
+  // Keep BLE setup status compact and stable.
+  // Radar details are intentionally not included in BLE status.
   payload += "\"ld2410ParsedFrames\":" + String(ld2410ParsedFrameCount) + ",";
   payload += "\"uptimeSeconds\":" + String(millis() / 1000) + ",";
   payload += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
@@ -707,6 +705,21 @@ void markServerFailure(String context, int responseCode) {
   Serial.println(sensorLabel() + " | " + lastWifiFailureReason);
 }
 
+void markSetupCloudFailure(String context, int responseCode) {
+  // Initial setup must treat Wi-Fi and cloud registration separately.
+  // A temporary Render/HTTPS failure must not make BLE show Wi-Fi as failed,
+  // must not increment the self-heal counter, and must not reconnect Wi-Fi.
+  lastServerFailureTime = millis();
+  String responseText = responseCode == 0 ? "no_response" : String(responseCode);
+  Serial.println(sensorLabel() + " | Setup cloud sync pending: " + context + " response " + responseText + ". Wi-Fi remains connected.");
+  if (WiFi.status() == WL_CONNECTED) {
+    lastConnectedIp = WiFi.localIP().toString();
+    lastConnectedSsid = WiFi.SSID();
+    lastWifiFailureReason = "";
+    lastWifiStatusText = "Wi-Fi connected; cloud sync pending: " + lastConnectedSsid + " / " + lastConnectedIp;
+  }
+}
+
 void markTelemetryFailure(String context, int responseCode) {
   // Best-effort radar telemetry failures should not increment the critical
   // server failure counter or force Wi-Fi reconnect/reboot. Presence detected
@@ -750,6 +763,7 @@ void reconnectWifiNow(String reason) {
 
 void handleSelfHealing() {
   if (setupModeStarted || firmwareUpdateInProgress || wifiName.length() == 0) return;
+  if (!nodeRegistered && WiFi.status() == WL_CONNECTED) return;
   if (millis() - lastSelfHealCheckTime < SELF_HEAL_CHECK_INTERVAL_MS) return;
   lastSelfHealCheckTime = millis();
   if (WiFi.status() != WL_CONNECTED) { reconnectWifiNow("Wi-Fi is disconnected"); return; }
@@ -764,7 +778,7 @@ void setup() {
   pinMode(PIR_PIN, INPUT); pinMode(PRESENCE_PIN, INPUT_PULLDOWN); pinMode(LED_PIN, OUTPUT);
   setLed(false);
   Serial.println();
-  Serial.println("Good Shepherd ESP32 Multi-Sensor v1.8.4 priority events / best-effort telemetry");
+  Serial.println("Good Shepherd ESP32 Multi-Sensor v1.8.5 simple human presence BLE fix");
   generateHardwareIds(); ensureSetupId(); loadSettings();
   if (modeUsesPresence()) startLd2410Uart();
   startBleManagement();
@@ -776,22 +790,50 @@ void loop() {
   if (firmwareUpdateInProgress) { delay(100); return; }
   if (setupModeStarted) server.handleClient();
   if (pendingBleCommand) { String command = pendingBleCommandPayload; pendingBleCommandPayload = ""; pendingBleCommand = false; handleBleCommand(command); }
+
+  // Keep local sensing and BLE alive, but keep the cloud sequence simple:
+  // Wi-Fi -> register -> heartbeat -> commands/firmware/telemetry/events.
   if (modeUsesPresence()) handleLd2410Radar();
-  handleWifiReconnect(); handleSelfHealing();
-  if (pendingFirmwareStatusCheck && WiFi.status() == WL_CONNECTED) {
-    pendingFirmwareStatusCheck = false;
-    if (millis() - lastFirmwareStatusCheckTime >= FIRMWARE_STATUS_CHECK_COOLDOWN_MS || lastFirmwareStatusCheckTime == 0) { lastFirmwareStatusCheckTime = millis(); checkLatestFirmwareStatusOnly(); }
-  }
+  handleWifiReconnect();
+
   if (WiFi.status() == WL_CONNECTED) {
-    if (millis() - lastCommandPollTime >= COMMAND_POLL_INTERVAL_MS) { pollSensorCommands(); lastCommandPollTime = millis(); }
-    if (!nodeRegistered && millis() - lastRegistrationAttemptTime >= REGISTRATION_RETRY_INTERVAL_MS) {
-      lastRegistrationAttemptTime = millis(); nodeRegistered = registerNode();
-      if (nodeRegistered) { sendHeartbeat(); lastHeartbeatTime = millis(); logSensor("Sensor online."); }
-      else { logSensor("Registration failed, but Wi-Fi is connected. Will retry in loop."); }
+    if (!nodeRegistered) {
+      if (millis() - lastRegistrationAttemptTime >= REGISTRATION_RETRY_INTERVAL_MS) {
+        lastRegistrationAttemptTime = millis();
+        nodeRegistered = registerNode();
+        if (nodeRegistered) {
+          consecutiveServerFailureCount = 0;
+          sendHeartbeat();
+          lastHeartbeatTime = millis();
+          logSensor("Sensor online.");
+        } else {
+          logSensor("Cloud registration pending, but Wi-Fi is connected. Will retry in loop.");
+        }
+      }
+    } else {
+      handleSelfHealing();
+
+      if (pendingFirmwareStatusCheck) {
+        pendingFirmwareStatusCheck = false;
+        if (millis() - lastFirmwareStatusCheckTime >= FIRMWARE_STATUS_CHECK_COOLDOWN_MS || lastFirmwareStatusCheckTime == 0) {
+          lastFirmwareStatusCheckTime = millis();
+          checkLatestFirmwareStatusOnly();
+        }
+      }
+
+      if (millis() - lastCommandPollTime >= COMMAND_POLL_INTERVAL_MS) {
+        pollSensorCommands();
+        lastCommandPollTime = millis();
+      }
+      if (millis() - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
+        sendHeartbeat();
+        lastHeartbeatTime = millis();
+      }
+      if (modeUsesMotion()) handleMotionSensor();
+      if (modeUsesPresence()) handlePresenceSensor();
     }
-    if (nodeRegistered && millis() - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) { sendHeartbeat(); lastHeartbeatTime = millis(); }
-    if (nodeRegistered) { if (modeUsesMotion()) handleMotionSensor(); if (modeUsesPresence()) handlePresenceSensor(); }
   }
+
   if (millis() - lastBleStatusUpdateTime >= BLE_STATUS_INTERVAL_MS) { lastBleStatusUpdateTime = millis(); updateBleStatus(); }
   delay(25);
 }
@@ -897,7 +939,7 @@ bool registerNode() {
   int responseCode = http.POST(payload); Serial.print(sensorLabel() + " | Registration response code: "); Serial.println(responseCode);
   http.end(); client.stop(); delay(50);
   if (responseCode >= 200 && responseCode < 300) { markServerSuccess("registerNode"); return true; }
-  markServerFailure("registerNode", responseCode); return false;
+  markSetupCloudFailure("registerNode", responseCode); return false;
 }
 
 String radarTelemetryJsonFields() {
@@ -1319,7 +1361,6 @@ void handleRoot() {
   html += "<label>Sensor Type</label><select id='sensorMode' name='sensorMode'>";
   html += "<option value='motion'" + String(sensorMode == "motion" ? " selected" : "") + ">Motion Sensor</option>";
   html += "<option value='human_presence'" + String(sensorMode == "human_presence" ? " selected" : "") + ">Human Presence Sensor</option>";
-  html += "<option value='motion_presence'" + String(sensorMode == "motion_presence" ? " selected" : "") + ">Motion + Presence Sensor</option>";
   html += "</select>";
   html += "<label>Wi-Fi Network</label><select id='wifiName' name='wifiName'>";
   if (networkCount <= 0) html += "<option value=''>No Wi-Fi networks found</option>";
@@ -1340,7 +1381,7 @@ void handleRoot() {
   html += "function autofillWifiPassword(){var ssid=wifiSelect.value;if(knownWifiPasswords[ssid]){passwordField.value=knownWifiPasswords[ssid];}}";
   html += "wifiSelect.addEventListener('change',autofillWifiPassword);autofillWifiPassword();";
   html += "var sensorSelect=document.getElementById('sensorMode');var deviceNameField=document.getElementById('deviceName');";
-  html += "function defaultDeviceNameForMode(mode){if(mode==='human_presence')return 'Human Presence Sensor';if(mode==='motion_presence')return 'Motion + Presence Sensor';return 'Motion Sensor';}";
+  html += "function defaultDeviceNameForMode(mode){if(mode==='human_presence')return 'Human Presence Sensor';return 'Motion Sensor';}";
   html += "sensorSelect.addEventListener('change',function(){deviceNameField.value=defaultDeviceNameForMode(sensorSelect.value);});";
   html += "</script></div></body></html>";
   server.send(200, "text/html", html);
