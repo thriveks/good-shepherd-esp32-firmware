@@ -1,12 +1,12 @@
 /*
   Good Shepherd ESP32 Multi-Sensor Firmware
-  Version: esp32-good-shepherd-v1.8.6-registration-first-ble-safe
-  Date: 2026-07-10
+  Version: esp32-good-shepherd-v1.8.7-gpio-presence-only
+  Date: 2026-07-11
 
   Supported sensor modes:
     motion            = PIR motion sensor on GPIO27
-    human_presence    = LD2410 OUT pin on GPIO21 + LD2410 UART radar telemetry
-    motion_presence   = PIR GPIO27 + LD2410 GPIO21 + LD2410 UART radar telemetry
+    human_presence    = LD2410 OUT pin on GPIO21 only
+    motion_presence   = PIR GPIO27 + LD2410 OUT pin on GPIO21
 
   Wiring:
     PIR VCC      -> ESP32 3V3
@@ -16,16 +16,15 @@
     LD2410 VCC   -> ESP32 5V / VIN
     LD2410 GND   -> ESP32 GND
     LD2410 OUT   -> ESP32 GPIO21
-    LD2410 TX    -> ESP32 GPIO16
-    LD2410 RX    -> ESP32 GPIO17 optional; can stay disconnected if only reading telemetry
+    LD2410 TX    -> Not used in this firmware
+    LD2410 RX    -> Not used in this firmware
 
   Notes:
     - LD2410 OUT uses INPUT_PULLDOWN on GPIO21.
-    - LD2410 UART runs on Serial2 at 256000 baud.
-    - v1.8.4 keeps presence_detected and presence_cleared as priority events.
-    - v1.8.4 makes presence_telemetry best-effort so radar samples do not overload HTTPS.
-    - v1.8.4 slows telemetry and prevents telemetry failures from driving self-heal resets.
-    - v1.8.5 keeps Wi-Fi/setup logic unchanged and only compacts BLE status for Human Presence setup stability.
+    - v1.8.7 removes LD2410 UART parsing and continuous presence telemetry.
+    - v1.8.7 keeps Human Presence as a simple, stable GPIO21 digital sensor.
+    - presence_detected and presence_cleared remain priority events.
+    - BLE, Wi-Fi, registration, heartbeat, OTA, motion, and AI event behavior are preserved.
 */
 
 #include <WiFi.h>
@@ -45,9 +44,6 @@
 #define PRESENCE_PIN 21
 #define PRESENCE_ACTIVE_STATE HIGH
 
-#define LD2410_RX_PIN 16
-#define LD2410_TX_PIN 17
-#define LD2410_UART_BAUD 256000
 
 #define LED_PIN 2
 #define LED_ACTIVE_STATE HIGH
@@ -55,7 +51,6 @@
 
 WebServer server(80);
 Preferences prefs;
-HardwareSerial LD2410Serial(2);
 
 String wifiName = "";
 String wifiPassword = "";
@@ -75,7 +70,7 @@ const char* HEARTBEAT_URL = "https://good-shepherd-server-j06f.onrender.com/node
 const char* LATEST_FIRMWARE_URL = "https://good-shepherd-server-j06f.onrender.com/firmware/latest";
 const char* WEBHOOK_SECRET = "7e9c767aa079423227163be90943d7d2";
 
-const char* SOFTWARE_VERSION = "esp32-good-shepherd-v1.8.6-registration-first-ble-safe";
+const char* SOFTWARE_VERSION = "esp32-good-shepherd-v1.8.8-gpio-presence-command-poll-noncritical";
 
 const char* BLE_SERVICE_UUID = "7d9f0001-2f4f-4c3a-8b2a-0b5f7f2a0001";
 const char* BLE_STATUS_UUID  = "7d9f0002-2f4f-4c3a-8b2a-0b5f7f2a0001";
@@ -97,7 +92,6 @@ bool bleClientConnected = false;
 bool pendingBleCommand = false;
 bool pendingFirmwareStatusCheck = false;
 bool wifiConnectInProgress = false;
-bool ld2410UartStarted = false;
 bool pendingPresenceDetectedEvent = false;
 bool pendingPresenceClearedEvent = false;
 
@@ -129,28 +123,7 @@ unsigned long lastPresenceWebhookSuccessTime = 0;
 unsigned long motionHeldActiveStartedAt = 0;
 unsigned long presenceHeldActiveStartedAt = 0;
 
-const int LD2410_BUFFER_SIZE = 256;
-uint8_t ld2410Buffer[LD2410_BUFFER_SIZE];
-int ld2410BufferCount = 0;
-unsigned long ld2410TotalBytesReceived = 0;
-unsigned long ld2410ParsedFrameCount = 0;
-unsigned long lastLd2410FrameTime = 0;
-unsigned long lastPresenceTelemetryAttemptTime = 0;
-unsigned long lastPresenceTelemetrySuccessTime = 0;
-unsigned long lastPresenceTelemetryFailureTime = 0;
-unsigned long lastRadarDebugPrintTime = 0;
 unsigned long lastPriorityHttpAttemptTime = 0;
-unsigned long lastBestEffortHttpAttemptTime = 0;
-
-bool radarPresence = false;
-uint8_t radarTargetState = 0;
-bool radarMovingTarget = false;
-bool radarStationaryTarget = false;
-uint16_t radarMovingDistanceCm = 0;
-uint8_t radarMovingEnergy = 0;
-uint16_t radarStationaryDistanceCm = 0;
-uint8_t radarStationaryEnergy = 0;
-uint16_t radarDetectionDistanceCm = 0;
 
 int consecutiveServerFailureCount = 0;
 
@@ -158,23 +131,17 @@ const unsigned long RESET_AFTER_NO_MOTION_MS = 10000;
 const unsigned long RESET_AFTER_NO_PRESENCE_MS = 10000;
 const unsigned long HEARTBEAT_INTERVAL_MS = 60000;
 const unsigned long RECONNECT_INTERVAL_MS = 10000;
-const unsigned long COMMAND_POLL_INTERVAL_MS = 15000;
+const unsigned long COMMAND_POLL_INTERVAL_MS = 60000;
 const unsigned long REGISTRATION_RETRY_INTERVAL_MS = 15000;
 const unsigned long BLE_STATUS_INTERVAL_MS = 5000;
 const unsigned long FIRMWARE_STATUS_CHECK_COOLDOWN_MS = 300000;
 const unsigned long HTTP_TIMEOUT_MS = 10000;
-const unsigned long TELEMETRY_HTTP_TIMEOUT_MS = 4500;
 const unsigned long SELF_HEAL_CHECK_INTERVAL_MS = 30000;
 const unsigned long SERVER_SILENCE_REBOOT_MS = 1800000;
 const unsigned long MOTION_RETRY_INTERVAL_MS = 15000;
 const unsigned long PRESENCE_RETRY_INTERVAL_MS = 15000;
-const unsigned long PRESENCE_TELEMETRY_ACTIVE_INTERVAL_MS = 5000;
-const unsigned long PRESENCE_TELEMETRY_CLEAR_INTERVAL_MS = 30000;
 const unsigned long MOTION_HELD_ACTIVE_RESET_MS = 300000;
 const unsigned long PRESENCE_HELD_ACTIVE_RESET_MS = 300000;
-const unsigned long TELEMETRY_SUPPRESS_AFTER_FAILURE_MS = 30000;
-const unsigned long TELEMETRY_MIN_HTTP_GAP_MS = 2500;
-const int TELEMETRY_MIN_RSSI_DBM = -82;
 const int SERVER_FAILURE_RECONNECT_THRESHOLD = 5;
 const int SERVER_FAILURE_REBOOT_THRESHOLD = 20;
 const int MAX_SAVED_WIFI = 8;
@@ -199,15 +166,9 @@ void handleMotionSensor();
 void handlePresenceSensor();
 bool sendMotionEvent();
 bool sendPresenceStateEvent(bool presenceActive);
-bool sendPresenceTelemetryEvent();
-void startLd2410Uart();
-void handleLd2410Radar();
 void markServerSuccess(String context);
 void markServerFailure(String context, int responseCode);
 void markSetupCloudFailure(String context, int responseCode);
-void markTelemetryFailure(String context, int responseCode);
-void markTelemetrySuccess(String context);
-bool networkHealthyForTelemetry();
 void reconnectWifiNow(String reason);
 void handleSelfHealing();
 void handleRoot();
@@ -388,107 +349,9 @@ String savedWifiJavaScriptMap() {
   return js;
 }
 
-// MARK: - LD2410 UART Radar
-void startLd2410Uart() {
-  if (ld2410UartStarted) return;
-  LD2410Serial.begin(LD2410_UART_BAUD, SERIAL_8N1, LD2410_RX_PIN, LD2410_TX_PIN);
-  ld2410UartStarted = true;
-  Serial.println("LD2410 UART started.");
-  Serial.println("LD2410 baud: " + String(LD2410_UART_BAUD));
-  Serial.println("LD2410 RX GPIO: " + String(LD2410_RX_PIN));
-  Serial.println("LD2410 TX GPIO: " + String(LD2410_TX_PIN));
-}
-
-void clearLd2410BufferUpTo(int count) {
-  if (count <= 0) return;
-  if (count >= ld2410BufferCount) { ld2410BufferCount = 0; return; }
-  for (int i = count; i < ld2410BufferCount; i++) ld2410Buffer[i - count] = ld2410Buffer[i];
-  ld2410BufferCount -= count;
-}
-
-int findLd2410Header() {
-  for (int i = 0; i <= ld2410BufferCount - 4; i++) {
-    if (ld2410Buffer[i] == 0xF4 && ld2410Buffer[i + 1] == 0xF3 && ld2410Buffer[i + 2] == 0xF2 && ld2410Buffer[i + 3] == 0xF1) return i;
-  }
-  return -1;
-}
-
-void printRadarDebug() {
-  Serial.println();
-  Serial.println("========== LD2410 RADAR DATA ==========");
-  Serial.print("presence: "); Serial.println(radarPresence ? "true" : "false");
-  Serial.print("targetState: "); Serial.println(radarTargetState);
-  Serial.print("movingTarget: "); Serial.println(radarMovingTarget ? "true" : "false");
-  Serial.print("movingDistanceCm: "); Serial.println(radarMovingDistanceCm);
-  Serial.print("movingEnergy: "); Serial.println(radarMovingEnergy);
-  Serial.print("stationaryTarget: "); Serial.println(radarStationaryTarget ? "true" : "false");
-  Serial.print("stationaryDistanceCm: "); Serial.println(radarStationaryDistanceCm);
-  Serial.print("stationaryEnergy: "); Serial.println(radarStationaryEnergy);
-  Serial.print("detectionDistanceCm: "); Serial.println(radarDetectionDistanceCm);
-  Serial.print("parsedFrameCount: "); Serial.println(ld2410ParsedFrameCount);
-  Serial.println("=======================================");
-  Serial.println();
-}
-
-void parseLd2410Frame(const uint8_t* frame, int length) {
-  if (length < 23) return;
-  if (frame[6] != 0x02 || frame[7] != 0xAA) return;
-  radarTargetState = frame[8];
-  radarPresence = radarTargetState > 0;
-  radarMovingTarget = radarTargetState == 1 || radarTargetState == 3;
-  radarStationaryTarget = radarTargetState == 2 || radarTargetState == 3;
-  radarMovingDistanceCm = readUInt16LE(frame[9], frame[10]);
-  radarMovingEnergy = frame[11];
-  radarStationaryDistanceCm = readUInt16LE(frame[12], frame[13]);
-  radarStationaryEnergy = frame[14];
-  radarDetectionDistanceCm = readUInt16LE(frame[17], frame[18]);
-  ld2410ParsedFrameCount++;
-  lastLd2410FrameTime = millis();
-  if (millis() - lastRadarDebugPrintTime >= 5000) { lastRadarDebugPrintTime = millis(); printRadarDebug(); }
-}
-
-void processLd2410Buffer() {
-  while (ld2410BufferCount >= 10) {
-    int headerIndex = findLd2410Header();
-    if (headerIndex < 0) {
-      if (ld2410BufferCount > 3) clearLd2410BufferUpTo(ld2410BufferCount - 3);
-      return;
-    }
-    if (headerIndex > 0) clearLd2410BufferUpTo(headerIndex);
-    if (ld2410BufferCount < 10) return;
-    uint16_t payloadLength = readUInt16LE(ld2410Buffer[4], ld2410Buffer[5]);
-    int totalFrameLength = 4 + 2 + payloadLength + 4;
-    if (totalFrameLength < 10 || totalFrameLength > LD2410_BUFFER_SIZE) { clearLd2410BufferUpTo(1); continue; }
-    if (ld2410BufferCount < totalFrameLength) return;
-    bool hasTail = ld2410Buffer[totalFrameLength - 4] == 0xF8 && ld2410Buffer[totalFrameLength - 3] == 0xF7 && ld2410Buffer[totalFrameLength - 2] == 0xF6 && ld2410Buffer[totalFrameLength - 1] == 0xF5;
-    if (!hasTail) { clearLd2410BufferUpTo(1); continue; }
-    parseLd2410Frame(ld2410Buffer, totalFrameLength);
-    clearLd2410BufferUpTo(totalFrameLength);
-  }
-}
-
-void handleLd2410Radar() {
-  if (!modeUsesPresence()) return;
-  if (!ld2410UartStarted) startLd2410Uart();
-  while (LD2410Serial.available()) {
-    uint8_t b = LD2410Serial.read();
-    ld2410TotalBytesReceived++;
-    if (ld2410BufferCount < LD2410_BUFFER_SIZE) ld2410Buffer[ld2410BufferCount++] = b;
-    else ld2410BufferCount = 0;
-  }
-  processLd2410Buffer();
-
-  // Radar telemetry is best-effort cloud data. Do not let it compete with
-  // priority alert delivery, heartbeat, command polling, or Wi-Fi recovery.
-  if (!nodeRegistered || WiFi.status() != WL_CONNECTED) return;
-  if (!networkHealthyForTelemetry()) return;
-
-  unsigned long interval = radarPresence ? PRESENCE_TELEMETRY_ACTIVE_INTERVAL_MS : PRESENCE_TELEMETRY_CLEAR_INTERVAL_MS;
-  if (lastLd2410FrameTime > 0 && millis() - lastPresenceTelemetryAttemptTime >= interval) {
-    lastPresenceTelemetryAttemptTime = millis();
-    sendPresenceTelemetryEvent();
-  }
-}
+// MARK: - Human Presence GPIO Input
+// LD2410 UART radar parsing was intentionally removed in v1.8.7.
+// The LD2410 OUT pin on GPIO21 remains the source of presence_detected and presence_cleared events.
 
 // MARK: - BLE
 void publishBleResult(String status, String message) {
@@ -564,7 +427,6 @@ String buildBleStatusPayload() {
   payload += "\"presenceState\":" + String(presenceState == PRESENCE_ACTIVE_STATE ? "true" : "false") + ",";
   // Keep BLE setup status compact and stable.
   // Radar details are intentionally not included in BLE status.
-  payload += "\"ld2410ParsedFrames\":" + String(ld2410ParsedFrameCount) + ",";
   payload += "\"uptimeSeconds\":" + String(millis() / 1000) + ",";
   payload += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
   payload += "\"serverFailures\":" + String(consecutiveServerFailureCount);
@@ -720,38 +582,6 @@ void markSetupCloudFailure(String context, int responseCode) {
   }
 }
 
-void markTelemetryFailure(String context, int responseCode) {
-  // Best-effort radar telemetry failures should not increment the critical
-  // server failure counter or force Wi-Fi reconnect/reboot. Presence detected
-  // and cleared events remain priority/retry events.
-  lastPresenceTelemetryFailureTime = millis();
-  String responseText = responseCode == 0 ? "no_response" : String(responseCode);
-  Serial.println(sensorLabel() + " | Best-effort telemetry failed: " + context + " response " + responseText + ". Critical failure count remains " + String(consecutiveServerFailureCount) + ".");
-}
-
-void markTelemetrySuccess(String context) {
-  lastServerSuccessTime = millis();
-  lastPresenceTelemetrySuccessTime = millis();
-  if (WiFi.status() == WL_CONNECTED) {
-    lastConnectedIp = WiFi.localIP().toString();
-    lastConnectedSsid = WiFi.SSID();
-    lastWifiStatusText = "Wi-Fi connected: " + lastConnectedSsid + " / " + lastConnectedIp;
-  }
-  Serial.println(sensorLabel() + " | Server success: " + context);
-}
-
-bool networkHealthyForTelemetry() {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  if (firmwareUpdateInProgress || wifiConnectInProgress || setupModeStarted) return false;
-  if (ESP.getFreeHeap() < 40000) return false;
-  if (WiFi.RSSI() < TELEMETRY_MIN_RSSI_DBM) return false;
-  if (consecutiveServerFailureCount > 0 && millis() - lastServerFailureTime < TELEMETRY_SUPPRESS_AFTER_FAILURE_MS) return false;
-  if (lastPresenceTelemetryFailureTime > 0 && millis() - lastPresenceTelemetryFailureTime < TELEMETRY_SUPPRESS_AFTER_FAILURE_MS) return false;
-  if (lastPriorityHttpAttemptTime > 0 && millis() - lastPriorityHttpAttemptTime < TELEMETRY_MIN_HTTP_GAP_MS) return false;
-  if (lastBestEffortHttpAttemptTime > 0 && millis() - lastBestEffortHttpAttemptTime < TELEMETRY_MIN_HTTP_GAP_MS) return false;
-  return true;
-}
-
 void reconnectWifiNow(String reason) {
   if (wifiName.length() == 0 || wifiPassword.length() == 0 || firmwareUpdateInProgress || wifiConnectInProgress) return;
   Serial.println(sensorLabel() + " | Self-heal Wi-Fi reconnect: " + reason);
@@ -778,9 +608,8 @@ void setup() {
   pinMode(PIR_PIN, INPUT); pinMode(PRESENCE_PIN, INPUT_PULLDOWN); pinMode(LED_PIN, OUTPUT);
   setLed(false);
   Serial.println();
-  Serial.println("Good Shepherd ESP32 Multi-Sensor v1.8.5 simple human presence BLE fix");
+  Serial.println("Good Shepherd ESP32 Multi-Sensor v1.8.8 GPIO presence + noncritical command polling");
   generateHardwareIds(); ensureSetupId(); loadSettings();
-  if (modeUsesPresence()) startLd2410Uart();
   startBleManagement();
   lastServerSuccessTime = millis();
   if (wifiName.length() > 0) connectToSavedWifi(); else startSetupMode();
@@ -791,9 +620,7 @@ void loop() {
   if (setupModeStarted) server.handleClient();
   if (pendingBleCommand) { String command = pendingBleCommandPayload; pendingBleCommandPayload = ""; pendingBleCommand = false; handleBleCommand(command); }
 
-  // Keep local sensing and BLE alive, but keep the cloud sequence simple:
-  // Wi-Fi -> register -> heartbeat -> commands/firmware/telemetry/events.
-  if (modeUsesPresence()) handleLd2410Radar();
+  // Keep local sensing and BLE alive. Presence is read directly from GPIO21.
   handleWifiReconnect();
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -862,7 +689,7 @@ void connectToSavedWifi() {
   updateBleStatus(); publishBleResult("running", lastWifiStatusText);
   WiFi.disconnect(true); delay(500); WiFi.mode(WIFI_STA); WiFi.setSleep(false); delay(250); WiFi.begin(cleanSsid.c_str(), wifiPassword.c_str());
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 40) { delay(500); Serial.print("."); attempts++; updateCachedWifiStatusText(); updateBleStatus(); if (modeUsesPresence()) handleLd2410Radar(); }
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) { delay(500); Serial.print("."); attempts++; updateCachedWifiStatusText(); updateBleStatus(); }
   Serial.println(); wifiConnectInProgress = false;
   if (WiFi.status() == WL_CONNECTED) {
     wifiName = cleanSsid; rememberWifiCredential(wifiName, wifiPassword);
@@ -895,7 +722,6 @@ void connectToNewWifiFromBle(String ssid, String password, String newLocation, S
   else if (combinedModeHint.indexOf("motion") >= 0 || combinedModeHint.indexOf("pir") >= 0) sensorMode = "motion";
   else sensorMode = "motion";
   if (newDeviceName.length() > 0) deviceName = newDeviceName; else deviceName = defaultDeviceNameForMode(sensorMode);
-  if (modeUsesPresence()) startLd2410Uart();
   Serial.println("Parsed sensorMode: " + parsedSensorMode); Serial.println("Final saved sensorMode: " + sensorMode); Serial.println("Final saved deviceName: " + deviceName);
   saveSettings(); rememberWifiCredential(wifiName, wifiPassword);
   if (shouldRestartAfterSave) { publishBleResult("success", "Wi-Fi saved. Restarting sensor."); delay(750); ESP.restart(); return; }
@@ -934,29 +760,12 @@ bool registerNode() {
   payload += "\"softwareVersion\":\"" + String(SOFTWARE_VERSION) + "\",";
   payload += "\"sensorMode\":\"" + jsonEscape(sensorMode) + "\",";
   payload += "\"sourceKey\":\"" + jsonEscape(sourceKey) + "\",";
-  payload += "\"radarTelemetry\":\"Enabled\"";
+  payload += "\"presenceInput\":\"GPIO21\"";
   payload += "}";
   int responseCode = http.POST(payload); Serial.print(sensorLabel() + " | Registration response code: "); Serial.println(responseCode);
   http.end(); client.stop(); delay(50);
   if (responseCode >= 200 && responseCode < 300) { markServerSuccess("registerNode"); return true; }
   markSetupCloudFailure("registerNode", responseCode); return false;
-}
-
-String radarTelemetryJsonFields() {
-  String fields = "";
-  fields += "\"radarPresence\":" + String(radarPresence ? "true" : "false") + ",";
-  fields += "\"targetState\":" + String(radarTargetState) + ",";
-  fields += "\"movingTarget\":" + String(radarMovingTarget ? "true" : "false") + ",";
-  fields += "\"movingDistanceCm\":" + String(radarMovingDistanceCm) + ",";
-  fields += "\"movingEnergy\":" + String(radarMovingEnergy) + ",";
-  fields += "\"stationaryTarget\":" + String(radarStationaryTarget ? "true" : "false") + ",";
-  fields += "\"stationaryDistanceCm\":" + String(radarStationaryDistanceCm) + ",";
-  fields += "\"stationaryEnergy\":" + String(radarStationaryEnergy) + ",";
-  fields += "\"detectionDistanceCm\":" + String(radarDetectionDistanceCm) + ",";
-  fields += "\"ld2410ParsedFrames\":" + String(ld2410ParsedFrameCount) + ",";
-  fields += "\"ld2410BytesReceived\":" + String(ld2410TotalBytesReceived) + ",";
-  fields += "\"lastLd2410FrameAgeMs\":" + String(lastLd2410FrameTime == 0 ? 0 : millis() - lastLd2410FrameTime);
-  return fields;
 }
 
 bool sendHeartbeat() {
@@ -992,7 +801,6 @@ bool sendHeartbeat() {
   payload += "\"sourceKey\":\"" + jsonEscape(sourceKey) + "\",";
   payload += "\"motionState\":" + String(motionState == MOTION_ACTIVE_STATE ? "true" : "false") + ",";
   payload += "\"presenceState\":" + String(presenceState == PRESENCE_ACTIVE_STATE ? "true" : "false") + ",";
-  payload += radarTelemetryJsonFields() + ",";
   payload += "\"diagnostics\":{";
   payload += "\"sourceKey\":\"" + sourceKey + "\",";
   payload += "\"setupId\":\"" + setupId + "\",";
@@ -1009,7 +817,6 @@ bool sendHeartbeat() {
   payload += "\"serverFailureCount\":" + String(consecutiveServerFailureCount) + ",";
   payload += "\"lastMotionWebhookSuccessSeconds\":" + String(lastMotionWebhookSuccessTime == 0 ? 0 : (lastMotionWebhookSuccessTime / 1000)) + ",";
   payload += "\"lastPresenceWebhookSuccessSeconds\":" + String(lastPresenceWebhookSuccessTime == 0 ? 0 : (lastPresenceWebhookSuccessTime / 1000)) + ",";
-  payload += "\"lastPresenceTelemetrySuccessSeconds\":" + String(lastPresenceTelemetrySuccessTime == 0 ? 0 : (lastPresenceTelemetrySuccessTime / 1000)) + ",";
   payload += "\"motionState\":" + String(motionState == MOTION_ACTIVE_STATE ? "true" : "false") + ",";
   payload += "\"presenceState\":" + String(presenceState == PRESENCE_ACTIVE_STATE ? "true" : "false") + ",";
   payload += "\"wifiStatus\":\"connected\",";
@@ -1027,11 +834,34 @@ void pollSensorCommands() {
   generateHardwareIds();
   String url = String(BASE_URL) + "/sensor-commands/" + nodeId + "/pending";
   WiFiClientSecure client; client.setInsecure();
-  HTTPClient http; http.setTimeout(HTTP_TIMEOUT_MS); http.setReuse(false); http.begin(client, url); http.addHeader("x-webhook-secret", WEBHOOK_SECRET);
+  HTTPClient http;
+  http.setTimeout(5000);
+  http.setReuse(false);
+  http.begin(client, url);
+  http.addHeader("x-webhook-secret", WEBHOOK_SECRET);
   int responseCode = http.GET();
-  if (responseCode != 200) { Serial.print(sensorLabel() + " | Command poll response code: "); Serial.println(responseCode); markServerFailure("pollSensorCommands", responseCode); http.end(); client.stop(); delay(50); return; }
-  String response = http.getString(); markServerSuccess("pollSensorCommands"); http.end(); client.stop(); delay(50);
+
+  if (responseCode != 200) {
+    // Command polling is optional remote-control traffic. It must never make
+    // an otherwise healthy sensor look offline, and it must never drive
+    // self-heal reconnects or reboot loops. Heartbeats and priority motion /
+    // presence events remain the source of truth for critical cloud health.
+    Serial.print(sensorLabel() + " | Command poll response code: ");
+    Serial.println(responseCode);
+    Serial.println(sensorLabel() + " | Command poll skipped as noncritical. " + httpErrorDescription(http, responseCode));
+    http.end();
+    client.stop();
+    delay(50);
+    return;
+  }
+
+  String response = http.getString();
+  http.end();
+  client.stop();
+  delay(50);
+
   if (response.indexOf("\"count\":0") >= 0) return;
+  markServerSuccess("pollSensorCommands_with_pending_command");
   logSensor("Command response received.");
   String commandId = extractJsonString(response, "commandId"); String commandType = extractJsonString(response, "commandType");
   logSensor("Command type: " + commandType);
@@ -1150,7 +980,7 @@ void handleBleCommand(String payload) {
   if (command == "set_sensor_mode") {
     String requestedSensorMode = extractJsonString(payload, "sensorMode"); String parsedSensorMode = normalizedSensorMode(requestedSensorMode);
     if (parsedSensorMode.length() == 0) { publishBleResult("failed", "Missing or invalid sensorMode."); return; }
-    sensorMode = parsedSensorMode; if (modeUsesPresence()) startLd2410Uart();
+    sensorMode = parsedSensorMode;
     String requestedDeviceName = extractJsonString(payload, "deviceName"); if (requestedDeviceName.length() > 0) deviceName = requestedDeviceName; else deviceName = defaultDeviceNameForMode(sensorMode);
     saveSettings(); publishBleResult("success", "Sensor mode saved: " + sensorMode + ". Restarting."); delay(750); ESP.restart(); return;
   }
@@ -1292,51 +1122,13 @@ bool sendPresenceStateEvent(bool presenceActive) {
   payload += "\"sensorType\":\"human_presence\",";
   payload += "\"source\":\"ld2410\",";
   payload += "\"eventType\":\"" + eventType + "\",";
-  payload += "\"presence\":" + String(presenceActive ? "true" : "false") + ",";
-  payload += radarTelemetryJsonFields();
+  payload += "\"presence\":" + String(presenceActive ? "true" : "false");
   payload += "}";
   lastPriorityHttpAttemptTime = millis();
   int responseCode = http.POST(payload); Serial.print(sensorLabel() + " | Presence state webhook response code: "); Serial.println(responseCode);
   http.end(); client.stop(); delay(50);
   if (responseCode >= 200 && responseCode < 300) { markServerSuccess(presenceActive ? "sendPresenceDetectedEvent" : "sendPresenceClearedEvent"); return true; }
   markServerFailure(presenceActive ? "sendPresenceDetectedEvent" : "sendPresenceClearedEvent", responseCode); return false;
-}
-
-bool sendPresenceTelemetryEvent() {
-  if (WiFi.status() != WL_CONNECTED) { markTelemetryFailure("sendPresenceTelemetryEvent_offline", 0); return false; }
-  if (!networkHealthyForTelemetry()) return false;
-
-  generateHardwareIds();
-  WiFiClientSecure client; client.setInsecure();
-  HTTPClient http; http.setTimeout(TELEMETRY_HTTP_TIMEOUT_MS); http.setReuse(false); http.begin(client, WEBHOOK_URL); http.addHeader("Content-Type", "application/json"); http.addHeader("x-webhook-secret", WEBHOOK_SECRET);
-  String fullSourceName = deviceName + " - " + roomName;
-  String zone = "clear";
-  uint16_t mainDistance = radarDetectionDistanceCm;
-  if (radarPresence) { if (mainDistance <= 120) zone = "near"; else if (mainDistance <= 300) zone = "middle"; else zone = "far"; }
-  String message = "Human presence telemetry from " + fullSourceName;
-  String payload = "{";
-  payload += "\"nodeId\":\"" + nodeId + "\",";
-  payload += "\"locationName\":\"" + jsonEscape(locationName) + "\",";
-  payload += "\"sourceKey\":\"" + sourceKey + "\",";
-  payload += "\"sourceName\":\"" + jsonEscape(fullSourceName) + "\",";
-  payload += "\"residentName\":\"" + jsonEscape(residentName) + "\",";
-  payload += "\"message\":\"" + jsonEscape(message) + "\",";
-  payload += "\"alertLevel\":\"Normal\",";
-  payload += "\"timeText\":\"ESP32 Human Presence Telemetry\",";
-  payload += "\"sensorMode\":\"" + jsonEscape(sensorMode) + "\",";
-  payload += "\"sensorType\":\"human_presence\",";
-  payload += "\"source\":\"ld2410\",";
-  payload += "\"eventType\":\"presence_telemetry\",";
-  payload += "\"presence\":" + String(radarPresence ? "true" : "false") + ",";
-  payload += "\"detectionZone\":\"" + zone + "\",";
-  payload += radarTelemetryJsonFields();
-  payload += "}";
-
-  lastBestEffortHttpAttemptTime = millis();
-  int responseCode = http.POST(payload); Serial.print(sensorLabel() + " | Presence telemetry webhook response code: "); Serial.println(responseCode);
-  http.end(); client.stop(); delay(50);
-  if (responseCode >= 200 && responseCode < 300) { markTelemetrySuccess("sendPresenceTelemetryEvent"); return true; }
-  markTelemetryFailure("sendPresenceTelemetryEvent", responseCode); return false;
 }
 
 // MARK: - Fallback Web Setup
@@ -1352,8 +1144,7 @@ void handleRoot() {
   html += "<br><br><b>Sensor Mode:</b><br>" + htmlEscape(sensorMode);
   html += "<br><br><b>Firmware:</b><br>" + String(SOFTWARE_VERSION);
   html += "<br><br><b>Wi-Fi Status:</b><br>" + htmlEscape(lastWifiStatusText);
-  html += "<br><br><b>LD2410 UART:</b><br>" + String(ld2410UartStarted ? "Enabled" : "Not Started");
-  html += "<br><br><b>LD2410 Frames:</b><br>" + String(ld2410ParsedFrameCount);
+  html += "<br><br><b>Presence Input:</b><br>GPIO21 OUT pin";
   html += "<br><br><b>BLE:</b><br>Enabled";
   html += "<br><br><b>Auto firmware install:</b><br>Disabled";
   html += "</div>";
@@ -1390,7 +1181,6 @@ void handleRoot() {
 void handleSave() {
   wifiName = server.arg("wifiName"); wifiPassword = server.arg("wifiPassword"); locationName = server.arg("locationName"); residentName = server.arg("residentName"); roomName = server.arg("roomName"); sensorMode = safeSensorModeOrMotion(server.arg("sensorMode")); deviceName = server.arg("deviceName");
   if (deviceName.length() == 0) deviceName = defaultDeviceNameForMode(sensorMode);
-  if (modeUsesPresence()) startLd2410Uart();
   saveSettings();
   server.send(200, "text/html", "<html><body style='font-family:Arial;padding:20px;'><h1>Good Shepherd Setup</h1><p>Sensor activated. Rebooting now.</p></body></html>");
   delay(2000); ESP.restart();
