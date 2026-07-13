@@ -1,7 +1,7 @@
 /*
   Good Shepherd ESP32 Multi-Sensor Firmware
-  Version: esp32-good-shepherd-v1.8.7-gpio-presence-only
-  Date: 2026-07-11
+  Version: esp32-good-shepherd-v1.9.5-true-lite-heartbeat
+  Date: 2026-07-12
 
   Supported sensor modes:
     motion            = PIR motion sensor on GPIO27
@@ -22,7 +22,15 @@
   Notes:
     - LD2410 OUT uses INPUT_PULLDOWN on GPIO21.
     - v1.8.7 removes LD2410 UART parsing and continuous presence telemetry.
-    - v1.8.7 keeps Human Presence as a simple, stable GPIO21 digital sensor.
+    - v1.8.8 makes command polling noncritical so optional command checks do not drive self-healing.
+    - v1.8.9 makes BLE status read-only/set-value instead of repeated notify to prevent BLE/Wi-Fi stack aborts.
+    - v1.9.1 isolated BLE service sessions from background cloud traffic.
+    - v1.9.3 adds heartbeat-lite retry when full /node-health HTTPS fails.
+    - v1.9.4 restores BLE status notifications for the Nearby Sensors screen.
+    - v1.9.5 makes heartbeat-lite actually lean and uses it as the primary heartbeat path.
+    - v1.9.4 restores BLE status notifications during active BLE service sessions.
+    - This keeps the Nearby Sensors screen live without allowing background cloud traffic to fight BLE.
+    - Human Presence is a simple, stable GPIO21 digital sensor.
     - presence_detected and presence_cleared remain priority events.
     - BLE, Wi-Fi, registration, heartbeat, OTA, motion, and AI event behavior are preserved.
 */
@@ -70,7 +78,7 @@ const char* HEARTBEAT_URL = "https://good-shepherd-server-j06f.onrender.com/node
 const char* LATEST_FIRMWARE_URL = "https://good-shepherd-server-j06f.onrender.com/firmware/latest";
 const char* WEBHOOK_SECRET = "7e9c767aa079423227163be90943d7d2";
 
-const char* SOFTWARE_VERSION = "esp32-good-shepherd-v1.8.8-gpio-presence-command-poll-noncritical";
+const char* SOFTWARE_VERSION = "esp32-good-shepherd-v1.9.5-true-lite-heartbeat";
 
 const char* BLE_SERVICE_UUID = "7d9f0001-2f4f-4c3a-8b2a-0b5f7f2a0001";
 const char* BLE_STATUS_UUID  = "7d9f0002-2f4f-4c3a-8b2a-0b5f7f2a0001";
@@ -122,6 +130,12 @@ unsigned long lastPresenceWebhookAttemptTime = 0;
 unsigned long lastPresenceWebhookSuccessTime = 0;
 unsigned long motionHeldActiveStartedAt = 0;
 unsigned long presenceHeldActiveStartedAt = 0;
+unsigned long lastBleClientConnectedAt = 0;
+unsigned long lastBleClientDisconnectedAt = 0;
+unsigned long lastBleCommandActivityAt = 0;
+unsigned long lastBleStatusSetAt = 0;
+unsigned long postBleWifiRecoveryAt = 0;
+bool pendingBleWifiRecovery = false;
 
 unsigned long lastPriorityHttpAttemptTime = 0;
 
@@ -133,9 +147,14 @@ const unsigned long HEARTBEAT_INTERVAL_MS = 60000;
 const unsigned long RECONNECT_INTERVAL_MS = 10000;
 const unsigned long COMMAND_POLL_INTERVAL_MS = 60000;
 const unsigned long REGISTRATION_RETRY_INTERVAL_MS = 15000;
-const unsigned long BLE_STATUS_INTERVAL_MS = 5000;
+const unsigned long BLE_STATUS_INTERVAL_MS = 30000;
+const unsigned long BLE_CONNECTED_STATUS_INTERVAL_MS = 10000;
 const unsigned long FIRMWARE_STATUS_CHECK_COOLDOWN_MS = 300000;
 const unsigned long HTTP_TIMEOUT_MS = 10000;
+const unsigned long BLE_CONNECTED_BACKGROUND_HEARTBEAT_MS = 120000;
+const unsigned long BLE_CONNECTED_CLOUD_QUIET_MS = 12000;
+const unsigned long BLE_POST_DISCONNECT_RESUME_DELAY_MS = 15000;
+const unsigned long BLE_POST_DISCONNECT_WIFI_RECOVERY_DELAY_MS = 8000;
 const unsigned long SELF_HEAL_CHECK_INTERVAL_MS = 30000;
 const unsigned long SERVER_SILENCE_REBOOT_MS = 1800000;
 const unsigned long MOTION_RETRY_INTERVAL_MS = 15000;
@@ -153,7 +172,9 @@ void connectToSavedWifi();
 void connectToNewWifiFromBle(String ssid, String password, String newLocation, String newResident, String newRoom, String newDeviceName, String newSensorMode, bool shouldRestartAfterSave);
 void handleWifiReconnect();
 bool registerNode();
-bool sendHeartbeat();
+int postNodeHealthPayload(String payload, unsigned long timeoutMs);
+String buildHeartbeatPayload(bool litePayload);
+bool sendHeartbeat(bool criticalFailure = true);
 void pollSensorCommands();
 void reportCommandResult(String commandId, String status, String message);
 bool checkLatestFirmwareStatusOnly();
@@ -162,6 +183,11 @@ void stopBleForFirmwareUpdate();
 void finishFirmwareUpdateFailure(String commandId, String message);
 String httpErrorDescription(HTTPClient& http, int responseCode);
 void handleBleCommand(String payload);
+bool bleClientCloudQuietActive();
+bool blePostDisconnectHoldActive();
+bool backgroundCloudAllowed();
+void markBleCommandActivity();
+void handlePostBleWifiRecovery();
 void handleMotionSensor();
 void handlePresenceSensor();
 bool sendMotionEvent();
@@ -439,7 +465,16 @@ void updateBleStatus() {
   if (bleStatusCharacteristic == nullptr) return;
   String payload = buildBleStatusPayload();
   bleStatusCharacteristic->setValue(payload.c_str());
-  if (bleClientConnected) bleStatusCharacteristic->notify();
+  lastBleStatusSetAt = millis();
+
+  // v1.9.4: the iOS Nearby Sensors screen expects live BLE status payloads.
+  // Notify only while a BLE client is connected. Background cloud traffic is
+  // still paused/throttled during the BLE service session, so BLE status updates
+  // no longer compete with heartbeat/command HTTPS calls.
+  if (bleClientConnected) {
+    bleStatusCharacteristic->notify();
+    Serial.println(sensorLabel() + " | BLE status notified.");
+  }
 }
 
 void blinkIdentifyLed(unsigned long durationMs) {
@@ -452,8 +487,25 @@ void blinkIdentifyLed(unsigned long durationMs) {
 }
 
 class GoodShepherdBleServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* server) { bleClientConnected = true; Serial.println("BLE client connected."); updateBleStatus(); }
-  void onDisconnect(BLEServer* server) { bleClientConnected = false; Serial.println("BLE client disconnected."); delay(250); BLEDevice::startAdvertising(); }
+  void onConnect(BLEServer* server) {
+    bleClientConnected = true;
+    lastBleClientConnectedAt = millis();
+    lastBleCommandActivityAt = millis();
+    Serial.println("BLE client connected. Background cloud traffic will be throttled during BLE service session.");
+    updateBleStatus();
+  }
+
+  void onDisconnect(BLEServer* server) {
+    bleClientConnected = false;
+    lastBleClientDisconnectedAt = millis();
+    postBleWifiRecoveryAt = millis() + BLE_POST_DISCONNECT_WIFI_RECOVERY_DELAY_MS;
+    pendingBleWifiRecovery = true;
+    lastHeartbeatTime = millis();
+    lastCommandPollTime = millis();
+    Serial.println("BLE client disconnected. Waiting for BLE/Wi-Fi radio stack to settle before cloud resumes.");
+    delay(250);
+    BLEDevice::startAdvertising();
+  }
 };
 
 class GoodShepherdBleCommandCallbacks : public BLECharacteristicCallbacks {
@@ -462,6 +514,7 @@ class GoodShepherdBleCommandCallbacks : public BLECharacteristicCallbacks {
     if (value.length() == 0) return;
     pendingBleCommandPayload = value;
     pendingBleCommand = true;
+    lastBleCommandActivityAt = millis();
     Serial.println("BLE command received: " + pendingBleCommandPayload);
   }
 };
@@ -491,6 +544,59 @@ void startBleManagement() {
   bleStarted = true;
   Serial.println("BLE management started.");
   Serial.println("BLE name: " + bleName);
+}
+
+
+// MARK: - BLE / Cloud Coexistence
+void markBleCommandActivity() {
+  lastBleCommandActivityAt = millis();
+}
+
+bool bleClientCloudQuietActive() {
+  if (!bleClientConnected) return false;
+  unsigned long now = millis();
+  if (lastBleCommandActivityAt > 0 && now - lastBleCommandActivityAt < BLE_CONNECTED_CLOUD_QUIET_MS) return true;
+  if (lastBleStatusSetAt > 0 && now - lastBleStatusSetAt < BLE_CONNECTED_CLOUD_QUIET_MS) return true;
+  return false;
+}
+
+bool blePostDisconnectHoldActive() {
+  if (bleClientConnected) return false;
+  if (lastBleClientDisconnectedAt == 0) return false;
+  return millis() - lastBleClientDisconnectedAt < BLE_POST_DISCONNECT_RESUME_DELAY_MS;
+}
+
+bool backgroundCloudAllowed() {
+  if (firmwareUpdateInProgress || wifiConnectInProgress) return false;
+  if (blePostDisconnectHoldActive()) return false;
+  if (bleClientConnected && bleClientCloudQuietActive()) return false;
+  return true;
+}
+
+void handlePostBleWifiRecovery() {
+  if (!pendingBleWifiRecovery) return;
+  if (bleClientConnected || firmwareUpdateInProgress || wifiConnectInProgress || setupModeStarted) return;
+  if (millis() < postBleWifiRecoveryAt) return;
+
+  pendingBleWifiRecovery = false;
+
+  if (wifiName.length() == 0 || wifiPassword.length() == 0) return;
+
+  Serial.println(sensorLabel() + " | BLE session ended. Refreshing Wi-Fi before cloud resume.");
+  nodeRegistered = false;
+  lastWifiStatusText = "BLE session ended. Refreshing Wi-Fi before cloud resume.";
+
+  WiFi.disconnect(false);
+  delay(300);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  delay(100);
+  WiFi.begin(wifiName.c_str(), wifiPassword.c_str());
+
+  lastReconnectAttempt = millis();
+  lastRegistrationAttemptTime = 0;
+  lastHeartbeatTime = millis();
+  lastCommandPollTime = millis();
 }
 
 // MARK: - Settings
@@ -608,7 +714,7 @@ void setup() {
   pinMode(PIR_PIN, INPUT); pinMode(PRESENCE_PIN, INPUT_PULLDOWN); pinMode(LED_PIN, OUTPUT);
   setLed(false);
   Serial.println();
-  Serial.println("Good Shepherd ESP32 Multi-Sensor v1.8.8 GPIO presence + noncritical command polling");
+  Serial.println("Good Shepherd ESP32 Multi-Sensor v1.9.5 true lite heartbeat");
   generateHardwareIds(); ensureSetupId(); loadSettings();
   startBleManagement();
   lastServerSuccessTime = millis();
@@ -621,11 +727,12 @@ void loop() {
   if (pendingBleCommand) { String command = pendingBleCommandPayload; pendingBleCommandPayload = ""; pendingBleCommand = false; handleBleCommand(command); }
 
   // Keep local sensing and BLE alive. Presence is read directly from GPIO21.
+  handlePostBleWifiRecovery();
   handleWifiReconnect();
 
   if (WiFi.status() == WL_CONNECTED) {
     if (!nodeRegistered) {
-      if (millis() - lastRegistrationAttemptTime >= REGISTRATION_RETRY_INTERVAL_MS) {
+      if (!bleClientConnected && !blePostDisconnectHoldActive() && millis() - lastRegistrationAttemptTime >= REGISTRATION_RETRY_INTERVAL_MS) {
         lastRegistrationAttemptTime = millis();
         nodeRegistered = registerNode();
         if (nodeRegistered) {
@@ -638,9 +745,9 @@ void loop() {
         }
       }
     } else {
-      handleSelfHealing();
+      if (!bleClientConnected) handleSelfHealing();
 
-      if (pendingFirmwareStatusCheck) {
+      if (!bleClientConnected && pendingFirmwareStatusCheck) {
         pendingFirmwareStatusCheck = false;
         if (millis() - lastFirmwareStatusCheckTime >= FIRMWARE_STATUS_CHECK_COOLDOWN_MS || lastFirmwareStatusCheckTime == 0) {
           lastFirmwareStatusCheckTime = millis();
@@ -648,20 +755,30 @@ void loop() {
         }
       }
 
-      if (millis() - lastCommandPollTime >= COMMAND_POLL_INTERVAL_MS) {
+      if (!bleClientConnected && millis() - lastCommandPollTime >= COMMAND_POLL_INTERVAL_MS) {
         pollSensorCommands();
         lastCommandPollTime = millis();
       }
-      if (millis() - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
+
+      if (bleClientConnected) {
+        // Active BLE field-service session: keep BLE controls responsive and avoid
+        // ESP32 BLE/HTTPS contention. Cloud heartbeat resumes after BLE disconnect
+        // and the Wi-Fi radio recovery window completes.
+      } else if (!blePostDisconnectHoldActive() && millis() - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
         sendHeartbeat();
         lastHeartbeatTime = millis();
       }
+
       if (modeUsesMotion()) handleMotionSensor();
       if (modeUsesPresence()) handlePresenceSensor();
     }
   }
 
-  if (millis() - lastBleStatusUpdateTime >= BLE_STATUS_INTERVAL_MS) { lastBleStatusUpdateTime = millis(); updateBleStatus(); }
+  unsigned long statusInterval = bleClientConnected ? BLE_CONNECTED_STATUS_INTERVAL_MS : BLE_STATUS_INTERVAL_MS;
+  if (millis() - lastBleStatusUpdateTime >= statusInterval) {
+    lastBleStatusUpdateTime = millis();
+    updateBleStatus();
+  }
   delay(25);
 }
 
@@ -689,7 +806,7 @@ void connectToSavedWifi() {
   updateBleStatus(); publishBleResult("running", lastWifiStatusText);
   WiFi.disconnect(true); delay(500); WiFi.mode(WIFI_STA); WiFi.setSleep(false); delay(250); WiFi.begin(cleanSsid.c_str(), wifiPassword.c_str());
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 40) { delay(500); Serial.print("."); attempts++; updateCachedWifiStatusText(); updateBleStatus(); }
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) { delay(500); Serial.print("."); attempts++; updateCachedWifiStatusText(); }
   Serial.println(); wifiConnectInProgress = false;
   if (WiFi.status() == WL_CONNECTED) {
     wifiName = cleanSsid; rememberWifiCredential(wifiName, wifiPassword);
@@ -697,7 +814,7 @@ void connectToSavedWifi() {
     Serial.println("Wi-Fi connected."); Serial.print("IP Address: "); Serial.println(WiFi.localIP()); Serial.print("RSSI: "); Serial.println(WiFi.RSSI());
     lastCommandPollTime = 0; lastRegistrationAttemptTime = 0;
     nodeRegistered = registerNode();
-    if (nodeRegistered) { sendHeartbeat(); lastHeartbeatTime = millis(); logSensor("Sensor online."); } else { logSensor("Registration failed, but Wi-Fi is connected. Will retry in loop."); }
+    if (nodeRegistered) { sendHeartbeat(!bleClientConnected); lastHeartbeatTime = millis(); logSensor("Sensor online."); } else { logSensor("Registration failed, but Wi-Fi is connected. Will retry in loop."); }
     pendingFirmwareStatusCheck = true; updateBleStatus(); publishBleResult("success", "Wi-Fi connected: " + lastConnectedIp);
   } else {
     String statusText = wifiStatusCodeText(WiFi.status());
@@ -768,12 +885,83 @@ bool registerNode() {
   markSetupCloudFailure("registerNode", responseCode); return false;
 }
 
-bool sendHeartbeat() {
-  if (WiFi.status() != WL_CONNECTED) return false;
+int postNodeHealthPayload(String payload, unsigned long timeoutMs) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(timeoutMs);
+
+  HTTPClient http;
+  http.setTimeout(timeoutMs);
+  http.setReuse(false);
+
+  if (!http.begin(client, HEARTBEAT_URL)) {
+    client.stop();
+    return -1000;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-webhook-secret", WEBHOOK_SECRET);
+
+  int responseCode = http.POST(payload);
+  http.end();
+  client.stop();
+  delay(75);
+  return responseCode;
+}
+
+String buildHeartbeatPayload(bool litePayload) {
   generateHardwareIds();
-  int motionState = digitalRead(PIR_PIN); int presenceState = digitalRead(PRESENCE_PIN);
-  WiFiClientSecure client; client.setInsecure();
-  HTTPClient http; http.setTimeout(HTTP_TIMEOUT_MS); http.setReuse(false); http.begin(client, HEARTBEAT_URL); http.addHeader("Content-Type", "application/json"); http.addHeader("x-webhook-secret", WEBHOOK_SECRET);
+  int motionState = digitalRead(PIR_PIN);
+  int presenceState = digitalRead(PRESENCE_PIN);
+
+  if (litePayload) {
+    // v1.9.5: true lean heartbeat. The old "lite" path still sent the
+    // full node-health payload, which is why Serial Monitor showed the lite
+    // payload was the same size as the full payload. Keep only the fields the
+    // server/app need to keep the node online and current.
+    String payload = "{";
+    payload += "\"nodeId\":\"" + nodeId + "\",";
+    payload += "\"nodeName\":\"" + jsonEscape(deviceName + " - " + roomName) + "\",";
+    payload += "\"locationName\":\"" + jsonEscape(locationName) + "\",";
+    payload += "\"localIp\":\"" + WiFi.localIP().toString() + "\",";
+    payload += "\"localConfigPort\":80,";
+    payload += "\"wifiRssi\":" + String(WiFi.RSSI()) + ",";
+    payload += "\"wifiSsid\":\"" + jsonEscape(WiFi.SSID()) + "\",";
+    payload += "\"setupId\":\"" + jsonEscape(setupId) + "\",";
+    payload += "\"assignmentState\":\"" + assignmentState() + "\",";
+    payload += "\"uptimeSeconds\":" + String(millis() / 1000) + ",";
+    payload += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
+    payload += "\"softwareVersion\":\"" + String(SOFTWARE_VERSION) + "\",";
+    payload += "\"monitorStatus\":\"Online\",";
+    payload += "\"platform\":\"ESP32\",";
+    payload += "\"hostname\":\"" + nodeId + "\",";
+    payload += "\"activeMonitorCount\":" + String(activeMonitorCountForMode()) + ",";
+    payload += "\"sensorMode\":\"" + jsonEscape(sensorMode) + "\",";
+    payload += "\"sourceKey\":\"" + jsonEscape(sourceKey) + "\",";
+    payload += "\"motionState\":" + String(motionState == MOTION_ACTIVE_STATE ? "true" : "false") + ",";
+    payload += "\"presenceState\":" + String(presenceState == PRESENCE_ACTIVE_STATE ? "true" : "false") + ",";
+    payload += "\"diagnostics\":{";
+    payload += "\"sourceKey\":\"" + jsonEscape(sourceKey) + "\",";
+    payload += "\"setupId\":\"" + jsonEscape(setupId) + "\",";
+    payload += "\"assignmentState\":\"" + assignmentState() + "\",";
+    payload += "\"deviceName\":\"" + jsonEscape(deviceName) + "\",";
+    payload += "\"sensorMode\":\"" + jsonEscape(sensorMode) + "\",";
+    payload += "\"roomName\":\"" + jsonEscape(roomName) + "\",";
+    payload += "\"residentName\":\"" + jsonEscape(residentName) + "\",";
+    payload += "\"locationName\":\"" + jsonEscape(locationName) + "\",";
+    payload += "\"wifiRssi\":" + String(WiFi.RSSI()) + ",";
+    payload += "\"localIp\":\"" + WiFi.localIP().toString() + "\",";
+    payload += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
+    payload += "\"serverFailureCount\":" + String(consecutiveServerFailureCount) + ",";
+    payload += "\"motionState\":" + String(motionState == MOTION_ACTIVE_STATE ? "true" : "false") + ",";
+    payload += "\"presenceState\":" + String(presenceState == PRESENCE_ACTIVE_STATE ? "true" : "false") + ",";
+    payload += "\"wifiStatus\":\"connected\",";
+    payload += "\"bleManagement\":\"Enabled\",";
+    payload += "\"heartbeatMode\":\"lite_primary\"";
+    payload += "}}";
+    return payload;
+  }
+
   String payload = "{";
   payload += "\"nodeId\":\"" + nodeId + "\",";
   payload += "\"nodeName\":\"" + jsonEscape(deviceName + " - " + roomName) + "\",";
@@ -801,11 +989,11 @@ bool sendHeartbeat() {
   payload += "\"sourceKey\":\"" + jsonEscape(sourceKey) + "\",";
   payload += "\"motionState\":" + String(motionState == MOTION_ACTIVE_STATE ? "true" : "false") + ",";
   payload += "\"presenceState\":" + String(presenceState == PRESENCE_ACTIVE_STATE ? "true" : "false") + ",";
+
   payload += "\"diagnostics\":{";
-  payload += "\"sourceKey\":\"" + sourceKey + "\",";
-  payload += "\"setupId\":\"" + setupId + "\",";
+  payload += "\"sourceKey\":\"" + jsonEscape(sourceKey) + "\",";
+  payload += "\"setupId\":\"" + jsonEscape(setupId) + "\",";
   payload += "\"assignmentState\":\"" + assignmentState() + "\",";
-  payload += "\"wifiSsid\":\"" + jsonEscape(WiFi.SSID()) + "\",";
   payload += "\"deviceName\":\"" + jsonEscape(deviceName) + "\",";
   payload += "\"sensorMode\":\"" + jsonEscape(sensorMode) + "\",";
   payload += "\"roomName\":\"" + jsonEscape(roomName) + "\",";
@@ -815,18 +1003,65 @@ bool sendHeartbeat() {
   payload += "\"localIp\":\"" + WiFi.localIP().toString() + "\",";
   payload += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
   payload += "\"serverFailureCount\":" + String(consecutiveServerFailureCount) + ",";
-  payload += "\"lastMotionWebhookSuccessSeconds\":" + String(lastMotionWebhookSuccessTime == 0 ? 0 : (lastMotionWebhookSuccessTime / 1000)) + ",";
-  payload += "\"lastPresenceWebhookSuccessSeconds\":" + String(lastPresenceWebhookSuccessTime == 0 ? 0 : (lastPresenceWebhookSuccessTime / 1000)) + ",";
   payload += "\"motionState\":" + String(motionState == MOTION_ACTIVE_STATE ? "true" : "false") + ",";
   payload += "\"presenceState\":" + String(presenceState == PRESENCE_ACTIVE_STATE ? "true" : "false") + ",";
   payload += "\"wifiStatus\":\"connected\",";
   payload += "\"bleManagement\":\"Enabled\",";
+  payload += "\"heartbeatMode\":\"normal\",";
   payload += "\"autoFirmwareInstallOnBoot\":false";
   payload += "}}";
-  int responseCode = http.POST(payload); Serial.print(sensorLabel() + " | Heartbeat response code: "); Serial.println(responseCode);
-  http.end(); client.stop(); delay(50);
-  if (responseCode >= 200 && responseCode < 300) { markServerSuccess("sendHeartbeat"); lastConnectedIp = WiFi.localIP().toString(); lastConnectedSsid = WiFi.SSID(); lastWifiStatusText = "Wi-Fi connected: " + lastConnectedSsid + " / " + lastConnectedIp; updateBleStatus(); return true; }
-  markServerFailure("sendHeartbeat", responseCode); return false;
+
+  return payload;
+}
+
+bool sendHeartbeat(bool criticalFailure) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  // v1.9.5: use the true-lite heartbeat as the primary heartbeat. The full
+  // heartbeat is kept only as a fallback for diagnostics. This avoids making
+  // every routine online check carry the larger legacy payload.
+  String litePayload = buildHeartbeatPayload(true);
+  Serial.print(sensorLabel() + " | Lite heartbeat payload bytes: ");
+  Serial.println(litePayload.length());
+
+  int liteResponseCode = postNodeHealthPayload(litePayload, HTTP_TIMEOUT_MS);
+  Serial.print(sensorLabel() + " | Lite heartbeat response code: ");
+  Serial.println(liteResponseCode);
+
+  if (liteResponseCode >= 200 && liteResponseCode < 300) {
+    markServerSuccess("sendHeartbeatLite");
+    lastConnectedIp = WiFi.localIP().toString();
+    lastConnectedSsid = WiFi.SSID();
+    lastWifiStatusText = "Wi-Fi connected: " + lastConnectedSsid + " / " + lastConnectedIp;
+    updateBleStatus();
+    return true;
+  }
+
+  Serial.println(sensorLabel() + " | Lite heartbeat failed. Retrying once with full node-health payload.");
+  delay(350);
+
+  String fullPayload = buildHeartbeatPayload(false);
+  Serial.print(sensorLabel() + " | Full heartbeat payload bytes: ");
+  Serial.println(fullPayload.length());
+
+  int responseCode = postNodeHealthPayload(fullPayload, 15000);
+  Serial.print(sensorLabel() + " | Full heartbeat response code: ");
+  Serial.println(responseCode);
+
+  if (responseCode >= 200 && responseCode < 300) {
+    markServerSuccess("sendHeartbeatFullRetry");
+    lastConnectedIp = WiFi.localIP().toString();
+    lastConnectedSsid = WiFi.SSID();
+    lastWifiStatusText = "Wi-Fi connected: " + lastConnectedSsid + " / " + lastConnectedIp;
+    updateBleStatus();
+    return true;
+  }
+
+  if (criticalFailure) markServerFailure("sendHeartbeat", responseCode);
+  else {
+    Serial.println(sensorLabel() + " | BLE-session heartbeat failed noncritically. Response: " + String(responseCode));
+  }
+  return false;
 }
 
 void pollSensorCommands() {
@@ -947,7 +1182,7 @@ void performFirmwareUpdate(String commandId, String firmwareUrl) {
   WiFiClientSecure client; client.setInsecure(); client.setTimeout(120000);
   HTTPClient http; http.setTimeout(180000); http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); http.setReuse(false);
   if (!http.begin(client, firmwareUrl)) { finishFirmwareUpdateFailure(commandId, "Firmware update failed: could not open firmware URL."); return; }
-  http.addHeader("User-Agent", "GoodShepherd-ESP32-OTA/1.8.4");
+  http.addHeader("User-Agent", "GoodShepherd-ESP32-OTA/1.9.5");
   int responseCode = http.GET(); Serial.print(sensorLabel() + " | Firmware HTTP response: "); Serial.println(httpErrorDescription(http, responseCode));
   if (responseCode != HTTP_CODE_OK) { String message = "Firmware update failed: download returned " + httpErrorDescription(http, responseCode) + "."; http.end(); client.stop(); finishFirmwareUpdateFailure(commandId, message); return; }
   int contentLength = http.getSize();
@@ -970,6 +1205,7 @@ void performFirmwareUpdate(String commandId, String firmwareUrl) {
 void handleBleCommand(String payload) {
   String command = extractJsonString(payload, "command"); if (command.length() == 0) command = extractJsonString(payload, "action"); command.toLowerCase();
   if (command.length() == 0) { publishBleResult("failed", "Missing BLE command."); return; }
+  markBleCommandActivity();
   logSensor("Handling BLE command: " + command);
   if (command == "get_status" || command == "status") { updateBleStatus(); publishBleResult("success", "Status refreshed. " + lastWifiStatusText); return; }
   if (command == "identify" || command == "locate") { publishBleResult("running", "Identify LED started."); blinkIdentifyLed(12000); publishBleResult("success", "Identify LED completed."); return; }
@@ -984,7 +1220,19 @@ void handleBleCommand(String payload) {
     String requestedDeviceName = extractJsonString(payload, "deviceName"); if (requestedDeviceName.length() > 0) deviceName = requestedDeviceName; else deviceName = defaultDeviceNameForMode(sensorMode);
     saveSettings(); publishBleResult("success", "Sensor mode saved: " + sensorMode + ". Restarting."); delay(750); ESP.restart(); return;
   }
-  if (command == "check_firmware") { checkLatestFirmwareStatusOnly(); return; }
+  if (command == "check_firmware") {
+    // During an active BLE session, do not make the ESP32 call Render for a
+    // firmware check. The app can compare this current version against the
+    // server release. Keep the BLE screen responsive and avoid BLE/HTTPS radio
+    // contention.
+    if (bleClientConnected) {
+      updateBleStatus();
+      publishBleResult("success", "Current firmware: " + String(SOFTWARE_VERSION) + ". Server check should be done by the app during BLE service.");
+      return;
+    }
+    checkLatestFirmwareStatusOnly();
+    return;
+  }
   if (command == "force_update" || command == "update_firmware") { String firmwareUrl = extractJsonString(payload, "firmwareUrl"); if (firmwareUrl.length() == 0) { publishBleResult("failed", "BLE firmware update requires firmwareUrl. Auto-install from latest is disabled."); return; } publishBleResult("running", "Firmware update starting from BLE URL."); performFirmwareUpdate("", firmwareUrl); return; }
   if (command == "restart" || command == "reboot") { publishBleResult("success", "Restarting sensor."); delay(750); ESP.restart(); return; }
   if (command == "reconfigure") { publishBleResult("success", "Clearing assignment and restarting."); clearAssignmentSettingsOnly(); delay(750); ESP.restart(); return; }
@@ -1003,6 +1251,11 @@ void handleMotionSensor() {
   } else motionHeldActiveStartedAt = 0;
   if (motion == MOTION_ACTIVE_STATE && !motionAlreadyReported) {
     if (lastMotionWebhookAttemptTime == 0 || millis() - lastMotionWebhookAttemptTime >= MOTION_RETRY_INTERVAL_MS) {
+      if (bleClientConnected) {
+        lastMotionWebhookAttemptTime = millis();
+        logSensor("Motion detected while BLE client is connected. Cloud event will wait until BLE disconnects.");
+        return;
+      }
       lastMotionWebhookAttemptTime = millis(); logSensor("Motion detected. Sending webhook...");
       if (sendMotionEvent()) { motionAlreadyReported = true; lastMotionWebhookSuccessTime = millis(); lastNoMotionTime = 0; } else logSensor("Motion webhook failed. Will retry while motion remains active.");
     }
@@ -1060,6 +1313,14 @@ void handlePresenceSensor() {
 
     if (!presenceAlreadyReported) pendingPresenceDetectedEvent = true;
 
+    if (pendingPresenceDetectedEvent && bleClientConnected) {
+      if (lastPresenceWebhookAttemptTime == 0 || millis() - lastPresenceWebhookAttemptTime >= PRESENCE_RETRY_INTERVAL_MS) {
+        lastPresenceWebhookAttemptTime = millis();
+        logSensor("Priority presence_detected pending while BLE client is connected. Cloud event will wait until BLE disconnects.");
+      }
+      return;
+    }
+
     if (pendingPresenceDetectedEvent && (lastPresenceWebhookAttemptTime == 0 || millis() - lastPresenceWebhookAttemptTime >= PRESENCE_RETRY_INTERVAL_MS)) {
       lastPresenceWebhookAttemptTime = millis();
       logSensor("Priority presence_detected pending. Sending/retrying webhook...");
@@ -1083,6 +1344,14 @@ void handlePresenceSensor() {
 
     if (millis() - lastNoPresenceTime > RESET_AFTER_NO_PRESENCE_MS) {
       pendingPresenceClearedEvent = true;
+
+      if (bleClientConnected) {
+        if (lastPresenceWebhookAttemptTime == 0 || millis() - lastPresenceWebhookAttemptTime >= PRESENCE_RETRY_INTERVAL_MS) {
+          lastPresenceWebhookAttemptTime = millis();
+          logSensor("Priority presence_cleared pending while BLE client is connected. Cloud event will wait until BLE disconnects.");
+        }
+        return;
+      }
 
       if (lastPresenceWebhookAttemptTime == 0 || millis() - lastPresenceWebhookAttemptTime >= PRESENCE_RETRY_INTERVAL_MS) {
         lastPresenceWebhookAttemptTime = millis();
