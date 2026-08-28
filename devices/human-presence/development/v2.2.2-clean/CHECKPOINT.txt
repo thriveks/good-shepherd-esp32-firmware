@@ -1,0 +1,25 @@
+Good Shepherd Human Presence Firmware
+Cleanup Candidate Checkpoint
+
+Based on:
+v2.2.2-clean
+
+Candidate source SHA-256:
+63a68aa16e2117b734741f2030a107d90eddde9dc0f0b6aeb09976c14a51ef16
+
+Validated:
+- Full source behavioral diff completed
+- No Wi-Fi behavior changes
+- No MQTT behavior changes
+- No BLE behavior changes
+- No OTA behavior changes
+- No presence-detection behavior changes
+- No persistence/reset behavior changes
+- Original v2.2.2 baseline compiles successfully
+- Cleanup candidate compiles successfully
+
+Intentional cleanup:
+- Removed unused sensorLabel() helper
+- Centralized duplicate human-presence mode validation
+
+Do not promote to production until controlled hardware validation is complete.
