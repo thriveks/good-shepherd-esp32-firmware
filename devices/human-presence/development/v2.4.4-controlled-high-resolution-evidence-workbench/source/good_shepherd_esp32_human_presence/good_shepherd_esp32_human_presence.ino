@@ -1,0 +1,8221 @@
+/*
+  Good Shepherd ESP32 Human Presence Firmware
+  Cleanup Workbench — Aggressive Pass 2
+  Date: 2026-08-27
+
+  Dedicated LD2410 human-presence firmware.
+  Production PIR/motion firmware is intentionally outside this branch.
+
+  Aggressive Pass 2:
+    - BLE-only commissioning/service.
+    - NimBLE-Arduino instead of classic ESP32 BLE/Bluedroid.
+    - MQTT V2 is the normal runtime transport.
+    - WebServer/SoftAP/HTML setup removed.
+    - Routine HTTPS heartbeat/command polling removed.
+    - HTTPS retained only for inventory registration bootstrap and OTA.
+    - Existing BLE UUIDs, MQTT topics, Preferences keys, command names,
+      presence event names, and OTA-by-URL behavior retained.
+
+  Required Arduino libraries:
+    - PubSubClient
+    - NimBLE-Arduino (h2zero)
+
+  Board:
+    ESP32 Dev Module
+
+  Wiring:
+    LD2410 VCC -> VIN / 5V
+    LD2410 GND -> GND
+    LD2410 OUT -> GPIO21
+*/
+
+#include <WiFi.h>
+#include <Preferences.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <Update.h>
+#include <NimBLEDevice.h>
+#include <esp_system.h>
+
+static constexpr uint8_t PRESENCE_PIN = 21;
+static constexpr uint8_t LED_PIN = 2;
+static constexpr uint8_t PRESENCE_ACTIVE_STATE = HIGH;
+
+// LD2410 UART2
+// LD2410 TX -> ESP32 RX2 / GPIO16
+// LD2410 RX -> ESP32 TX2 / GPIO17
+static constexpr uint8_t LD2410_RX_PIN = 16;
+static constexpr uint8_t LD2410_TX_PIN = 17;
+static constexpr uint32_t LD2410_UART_BAUD = 256000;
+
+// Development MQTT visibility.
+// High-frequency/raw diagnostics are OFF by default.
+// Semantic presence-state diagnostics remain enabled because they
+// publish only on stable state changes.
+static constexpr bool LD2410_RAW_DIAGNOSTIC_ENABLED = false;
+static constexpr bool GPIO21_RAW_DIAGNOSTIC_ENABLED = false;
+static constexpr bool PRESENCE_STATE_DIAGNOSTIC_ENABLED = true;
+
+static const char* SOFTWARE_VERSION =
+  "esp32-good-shepherd-human-presence-v2.4.4-controlled-high-resolution-evidence";
+
+HardwareSerial LD2410Serial(2);
+
+static constexpr int LD2410_BUFFER_SIZE = 256;
+uint8_t ld2410Buffer[LD2410_BUFFER_SIZE];
+int ld2410BufferCount = 0;
+
+unsigned long ld2410TotalBytesReceived = 0;
+unsigned long ld2410ParsedFrameCount = 0;
+unsigned long lastLd2410FrameAt = 0;
+
+// ============================================================
+// v2.4.4 DEVELOPMENT-ONLY CONTROLLED HIGH-RESOLUTION ACTIVITY EVIDENCE v1
+//
+// Observer-only raw LD2410 frame evidence.
+//
+// Acquisition:
+//   maximum one sample per successfully parsed LD2410 frame.
+//
+// Transport:
+//   approximately one-second batches.
+//
+// This layer does NOT:
+//   - alter GPIO21 occupancy authority
+//   - alter UART parsing
+//   - alter feature extraction
+//   - alter baseline learning
+//   - alter deviation/candidate/episode behavior
+//   - classify activities
+//   - infer falls, emergencies, risk, or care decisions
+// ============================================================
+
+static constexpr uint8_t
+  LD2410_HIGH_RES_BATCH_CAPACITY = 12;
+
+static constexpr unsigned long
+  LD2410_HIGH_RES_BATCH_INTERVAL_MS = 1000UL;
+
+struct Ld2410HighResolutionSample {
+  uint32_t frameSequence;
+  unsigned long uptimeMs;
+  uint8_t targetState;
+  bool radarPresence;
+  bool movingTarget;
+  uint16_t movingDistanceCm;
+  uint8_t movingEnergy;
+  bool stationaryTarget;
+  uint16_t stationaryDistanceCm;
+  uint8_t stationaryEnergy;
+  uint16_t detectionDistanceCm;
+  uint8_t stablePresenceState;
+};
+
+Ld2410HighResolutionSample
+  ld2410HighResolutionBatch[LD2410_HIGH_RES_BATCH_CAPACITY];
+
+uint8_t ld2410HighResolutionBatchCount = 0;
+uint32_t ld2410HighResolutionBatchSequence = 0;
+
+unsigned long ld2410HighResolutionBatchStartedAt = 0;
+unsigned long ld2410HighResolutionLastPublishAt = 0;
+
+uint32_t ld2410HighResolutionDroppedSamples = 0;
+
+// Development evidence capture is explicitly opt-in.
+// Reboot always returns the sensor to normal operation with
+// high-resolution evidence disabled.
+bool ld2410HighResolutionEnabled = false;
+unsigned long lastLd2410DiagnosticAt = 0;
+
+bool ld2410RadarPresence = false;
+uint8_t ld2410TargetState = 0;
+bool ld2410MovingTarget = false;
+bool ld2410StationaryTarget = false;
+uint16_t ld2410MovingDistanceCm = 0;
+uint8_t ld2410MovingEnergy = 0;
+uint16_t ld2410StationaryDistanceCm = 0;
+uint8_t ld2410StationaryEnergy = 0;
+uint16_t ld2410DetectionDistanceCm = 0;
+
+static const char* REGISTER_URL =
+  "https://good-shepherd-server-j06f.onrender.com/nodes/register";
+
+static const char* MQTT_HOST =
+  "c3f9bcc09adc4e7db6a3d29b63a24819.s1.eu.hivemq.cloud";
+static constexpr uint16_t MQTT_PORT = 8883;
+static const char* MQTT_USERNAME = "good-shepherd-pilot";
+static const char* MQTT_PASSWORD = "Goodshepherd1!";
+
+static const char* FACTORY_WIFI_SSID = "PRESTIGE HOMECARE OFFICE";
+static const char* FACTORY_WIFI_PASSWORD = "Delaware109%";
+static const char* FACTORY_REGISTRATION_MARKER_KEY = "invRegV1";
+
+static const char* BLE_SERVICE_UUID =
+  "7d9f0001-2f4f-4c3a-8b2a-0b5f7f2a0001";
+static const char* BLE_STATUS_UUID =
+  "7d9f0002-2f4f-4c3a-8b2a-0b5f7f2a0001";
+static const char* BLE_COMMAND_UUID =
+  "7d9f0003-2f4f-4c3a-8b2a-0b5f7f2a0001";
+static const char* BLE_RESULT_UUID =
+  "7d9f0004-2f4f-4c3a-8b2a-0b5f7f2a0001";
+
+static constexpr unsigned long BLE_BOOT_SETUP_WINDOW_MS = 60000UL;
+static constexpr unsigned long BLE_STATUS_INTERVAL_MS = 10000UL;
+static constexpr unsigned long BLE_MAX_CONNECTED_SESSION_MS = 120000UL;
+static constexpr unsigned long WIFI_RECONNECT_INTERVAL_MS = 10000UL;
+static constexpr unsigned long MQTT_RECONNECT_INTERVAL_MS = 10000UL;
+static constexpr unsigned long MQTT_STATUS_INTERVAL_MS = 60000UL;
+static constexpr unsigned long MQTT_WIFI_SETTLE_MS = 2500UL;
+static constexpr unsigned long FACTORY_WIFI_TIMEOUT_MS = 15000UL;
+static constexpr unsigned long PRESENCE_CLEAR_DELAY_MS = 10000UL;
+static constexpr unsigned long PRESENCE_EVENT_RETRY_MS = 15000UL;
+static constexpr unsigned long PRESENCE_HELD_ACTIVE_REARM_MS = 300000UL;
+static constexpr uint16_t MQTT_KEEPALIVE_SECONDS = 30;
+static constexpr uint16_t MQTT_BUFFER_SIZE = 2048;
+
+Preferences prefs;
+
+String wifiName;
+String wifiPassword;
+String locationName;
+String residentName;
+String roomName;
+String deviceName = "Human Presence Sensor";
+
+String nodeId;
+String ld2410EvidenceBootSessionId;
+String sourceKey;
+String setupId;
+
+WiFiClientSecure mqttTls;
+PubSubClient mqtt(mqttTls);
+
+NimBLEServer* bleServer = nullptr;
+NimBLECharacteristic* bleStatus = nullptr;
+NimBLECharacteristic* bleCommand = nullptr;
+NimBLECharacteristic* bleResult = nullptr;
+
+bool bleStarted = false;
+bool bleClientConnected = false;
+bool bleBootWindowActive = false;
+bool bleReleasedForRuntime = false;
+unsigned long bleBootWindowStartedAt = 0;
+unsigned long bleConnectedAt = 0;
+unsigned long lastBleStatusAt = 0;
+
+bool pendingBleCommand = false;
+String pendingBleCommandPayload;
+
+bool pendingMqttCommand = false;
+String pendingMqttCommandPayload;
+
+bool wifiConnectInProgress = false;
+unsigned long lastWifiAttemptAt = 0;
+unsigned long wifiConnectedAt = 0;
+unsigned long lastMqttAttemptAt = 0;
+unsigned long lastStatusPublishAt = 0;
+
+int lastPresenceState = -1;
+bool presenceReported = false;
+bool pendingPresenceDetected = false;
+bool pendingPresenceCleared = false;
+unsigned long noPresenceStartedAt = 0;
+unsigned long presenceHeldStartedAt = 0;
+unsigned long lastPresenceAttemptAt = 0;
+
+// Human Presence occupancy-session intelligence.
+//
+// GPIO21 remains authoritative for coarse occupancy start/end.
+// LD2410 UART semantic state is used only to divide occupied time
+// into moving and stationary behavior.
+//
+// These counters are local. They do not generate periodic MQTT traffic.
+bool ld2410OccupancySessionActive = false;
+unsigned long ld2410OccupancySessionStartedAt = 0;
+unsigned long ld2410OccupancyLastSampleAt = 0;
+unsigned long ld2410OccupancyMovingMs = 0;
+unsigned long ld2410OccupancyStationaryMs = 0;
+
+// Most recently completed session.
+// Retained locally until its presence_cleared event is published.
+bool ld2410CompletedSessionReady = false;
+unsigned long ld2410CompletedSessionDurationMs = 0;
+unsigned long ld2410CompletedMovingMs = 0;
+unsigned long ld2410CompletedStationaryMs = 0;
+
+
+String jsonEscape(String value) {
+  value.replace("\\", "\\\\");
+  value.replace("\"", "\\\"");
+  value.replace("\n", "\\n");
+  value.replace("\r", "");
+  return value;
+}
+
+String extractJsonString(const String& json, const String& key) {
+  String needle = "\"" + key + "\"";
+  int keyPos = json.indexOf(needle);
+  if (keyPos < 0) return "";
+  int colon = json.indexOf(':', keyPos + needle.length());
+  if (colon < 0) return "";
+  int quote = json.indexOf('"', colon + 1);
+  if (quote < 0) return "";
+
+  String out;
+  bool escaped = false;
+  for (int i = quote + 1; i < (int)json.length(); ++i) {
+    char c = json[i];
+    if (escaped) {
+      if (c == 'n') out += '\n';
+      else if (c == 'r') out += '\r';
+      else if (c == 't') out += '\t';
+      else out += c;
+      escaped = false;
+      continue;
+    }
+    if (c == '\\') {
+      escaped = true;
+      continue;
+    }
+    if (c == '"') return out;
+    out += c;
+  }
+  return "";
+}
+
+bool extractJsonBool(const String& json, const String& key, bool fallback) {
+  String needle = "\"" + key + "\"";
+  int keyPos = json.indexOf(needle);
+  if (keyPos < 0) return fallback;
+  int colon = json.indexOf(':', keyPos + needle.length());
+  if (colon < 0) return fallback;
+
+  String tail = json.substring(colon + 1);
+  tail.trim();
+  if (tail.startsWith("true")) return true;
+  if (tail.startsWith("false")) return false;
+  return fallback;
+}
+
+String chipId() {
+  uint64_t mac = ESP.getEfuseMac();
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%04X%08X",
+           (uint16_t)(mac >> 32), (uint32_t)mac);
+  String result(buf);
+  result.toLowerCase();
+  return result;
+}
+
+void ensureIdentity() {
+  String chip = chipId();
+  nodeId = "esp32-" + chip;
+  sourceKey = "presence-" + chip;
+
+  prefs.begin("gs-device", false);
+  setupId = prefs.getString("setupId", "");
+  if (setupId.length() == 0) {
+    setupId = chip.substring(chip.length() >= 6 ? chip.length() - 6 : 0);
+    setupId.toUpperCase();
+    prefs.putString("setupId", setupId);
+  }
+  prefs.end();
+}
+
+String assignmentState() {
+  return (locationName.length() && residentName.length() && roomName.length())
+    ? "Assigned" : "Unassigned";
+}
+
+bool isHumanPresenceMode(const String& mode) {
+  return mode == "human_presence" ||
+         mode == "presence" ||
+         mode == "human presence";
+}
+
+#define logLine(message) do { } while (0)
+
+void setLed(bool on) {
+  digitalWrite(LED_PIN, on ? HIGH : LOW);
+}
+
+void blinkIdentify(unsigned long durationMs = 12000UL) {
+  unsigned long started = millis();
+  bool state = false;
+  while (millis() - started < durationMs) {
+    state = !state;
+    setLed(state);
+    delay(150);
+  }
+  setLed(false);
+}
+
+void loadSettings() {
+  prefs.begin("gs-device", true);
+  wifiName = prefs.getString("wifiName", "");
+  wifiPassword = prefs.getString("wifiPass", "");
+  locationName = prefs.getString("location", "");
+  residentName = prefs.getString("resident", "");
+  roomName = prefs.getString("room", "");
+  deviceName = prefs.getString("deviceName", "Human Presence Sensor");
+  prefs.end();
+
+  if (deviceName.length() == 0) deviceName = "Human Presence Sensor";
+}
+
+void saveSettings() {
+  prefs.begin("gs-device", false);
+  prefs.putString("wifiName", wifiName);
+  prefs.putString("wifiPass", wifiPassword);
+  prefs.putString("location", locationName);
+  prefs.putString("resident", residentName);
+  prefs.putString("room", roomName);
+  prefs.putString("deviceName", deviceName);
+  prefs.putString("sensorMode", "human_presence");
+  prefs.remove("nodeId");
+  prefs.remove("sourceKey");
+  prefs.end();
+}
+
+void clearAssignmentSettingsOnly() {
+  prefs.begin("gs-device", false);
+  prefs.remove("wifiName");
+  prefs.remove("wifiPass");
+  prefs.remove("location");
+  prefs.remove("resident");
+  prefs.remove("room");
+  prefs.remove("deviceName");
+  prefs.remove("sensorMode");
+  prefs.remove("nodeId");
+  prefs.remove("sourceKey");
+  prefs.end();
+}
+
+void factoryClearEverything() {
+  prefs.begin("gs-device", false);
+  prefs.clear();
+  prefs.end();
+}
+
+String statusTopic()   { return "good-shepherd/v2/nodes/" + nodeId + "/status"; }
+String eventsTopic()   { return "good-shepherd/v2/nodes/" + nodeId + "/events"; }
+String commandsTopic() { return "good-shepherd/v2/nodes/" + nodeId + "/commands"; }
+String resultsTopic()  { return "good-shepherd/v2/nodes/" + nodeId + "/results"; }
+
+String mqttClientId() {
+  String chip = nodeId;
+  chip.replace("esp32-", "");
+  if (chip.length() > 12) chip = chip.substring(chip.length() - 12);
+  return "gsv2-" + chip;
+}
+
+String statusPayload(bool online) {
+  String p;
+  p.reserve(700);
+  p += "{";
+  p += "\"protocolVersion\":\"2.0\",";
+  p += "\"nodeId\":\"" + jsonEscape(nodeId) + "\",";
+  p += "\"nodeName\":\"" + jsonEscape(deviceName + " - " + roomName) + "\",";
+  p += "\"deviceName\":\"" + jsonEscape(deviceName) + "\",";
+  p += "\"locationName\":\"" + jsonEscape(locationName) + "\",";
+  p += "\"residentName\":\"" + jsonEscape(residentName) + "\",";
+  p += "\"roomName\":\"" + jsonEscape(roomName) + "\",";
+  p += "\"setupId\":\"" + jsonEscape(setupId) + "\",";
+  p += "\"assignmentState\":\"" + assignmentState() + "\",";
+  p += "\"softwareVersion\":\"" + String(SOFTWARE_VERSION) + "\",";
+  p += "\"sensorMode\":\"human_presence\",";
+  p += "\"sourceKey\":\"" + jsonEscape(sourceKey) + "\",";
+  p += "\"localIp\":\"" + WiFi.localIP().toString() + "\",";
+  p += "\"wifiSsid\":\"" + jsonEscape(WiFi.SSID()) + "\",";
+  p += "\"wifiRssi\":" + String(WiFi.RSSI()) + ",";
+  p += "\"uptimeSeconds\":" + String(millis() / 1000UL) + ",";
+  p += "\"online\":" + String(online ? "true" : "false") + ",";
+  p += "\"presence\":" +
+       String(digitalRead(PRESENCE_PIN) == PRESENCE_ACTIVE_STATE ? "true" : "false");
+  p += "}";
+  return p;
+}
+
+String lastWillPayload() {
+  return "{\"protocolVersion\":\"2.0\",\"nodeId\":\"" +
+         jsonEscape(nodeId) + "\",\"online\":false}";
+}
+
+bool publishStatus(bool online) {
+  if (!mqtt.connected()) return false;
+  String p = statusPayload(online);
+  bool ok = mqtt.publish(statusTopic().c_str(), p.c_str(), true);
+  if (ok && online) lastStatusPublishAt = millis();
+  return ok;
+}
+
+bool publishCommandResult(
+  const String& commandId,
+  const String& commandType,
+  const String& status,
+  const String& message
+) {
+  if (!mqtt.connected()) return false;
+
+  String p;
+  p.reserve(450);
+  p += "{";
+  p += "\"protocolVersion\":\"2.0\",";
+  p += "\"nodeId\":\"" + jsonEscape(nodeId) + "\",";
+  p += "\"commandId\":\"" + jsonEscape(commandId) + "\",";
+  p += "\"commandType\":\"" + jsonEscape(commandType) + "\",";
+  p += "\"status\":\"" + jsonEscape(status) + "\",";
+  p += "\"message\":\"" + jsonEscape(message) + "\"";
+  p += "}";
+
+  bool ok = mqtt.publish(resultsTopic().c_str(), p.c_str(), false);
+  mqtt.loop();
+  return ok;
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (pendingMqttCommand) return;
+
+  String body;
+  body.reserve(length + 1);
+  for (unsigned int i = 0; i < length; ++i) body += (char)payload[i];
+
+  if (extractJsonString(body, "commandId").length() == 0 ||
+      extractJsonString(body, "commandType").length() == 0) {
+    return;
+  }
+
+  pendingMqttCommandPayload = body;
+  pendingMqttCommand = true;
+}
+
+void configureMqtt() {
+  static bool configured = false;
+  if (configured) return;
+
+  mqttTls.setInsecure();
+  mqttTls.setTimeout(12000);
+
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setKeepAlive(MQTT_KEEPALIVE_SECONDS);
+  mqtt.setSocketTimeout(8);
+  mqtt.setBufferSize(MQTT_BUFFER_SIZE);
+  mqtt.setCallback(mqttCallback);
+
+  configured = true;
+}
+
+bool connectMqtt() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  if (wifiConnectedAt == 0) {
+    wifiConnectedAt = millis();
+    return false;
+  }
+
+  if (millis() - wifiConnectedAt < MQTT_WIFI_SETTLE_MS) return false;
+  if (mqtt.connected()) return true;
+
+  unsigned long now = millis();
+  if (lastMqttAttemptAt &&
+      now - lastMqttAttemptAt < MQTT_RECONNECT_INTERVAL_MS) {
+    return false;
+  }
+  lastMqttAttemptAt = now;
+
+  configureMqtt();
+
+  mqttTls.stop();
+  mqttTls.setInsecure();
+  mqttTls.setTimeout(12000);
+
+  String willTopic = statusTopic();
+  String willPayload = lastWillPayload();
+
+  bool ok = mqtt.connect(
+    mqttClientId().c_str(),
+    MQTT_USERNAME,
+    MQTT_PASSWORD,
+    willTopic.c_str(),
+    1,
+    true,
+    willPayload.c_str()
+  );
+
+  if (!ok) {
+    logLine("MQTT connect failed state=" + String(mqtt.state()));
+    return false;
+  }
+
+  mqtt.subscribe(commandsTopic().c_str(), 1);
+  publishStatus(true);
+  logLine("MQTT connected.");
+  return true;
+}
+
+
+// ============================================================
+// MQTT EPISODE EVIDENCE TRANSPORT v1
+//
+// Descriptive evidence transport only.
+// No classification, alerting, promotion, or learning changes.
+// ============================================================
+
+static constexpr uint8_t
+  LD2410_EVIDENCE_TRANSPORT_QUEUE_CAPACITY = 4;
+
+static constexpr unsigned long
+  LD2410_EVIDENCE_TRANSPORT_RETRY_MS = 15000UL;
+
+static constexpr size_t
+  LD2410_EVIDENCE_TRANSPORT_PAYLOAD_TARGET_BYTES = 1500;
+
+String ld2410EvidenceTransportPayload[
+  LD2410_EVIDENCE_TRANSPORT_QUEUE_CAPACITY
+];
+
+uint8_t ld2410EvidenceTransportHead = 0;
+uint8_t ld2410EvidenceTransportCount = 0;
+
+uint32_t ld2410EvidenceTransportDropped = 0;
+uint32_t ld2410EvidenceTransportPublished = 0;
+uint32_t ld2410EvidenceTransportPublishFailures = 0;
+
+unsigned long ld2410EvidenceTransportLastAttemptAt = 0;
+
+
+static String ld2410EvidenceTransportEventId(
+  uint32_t episodeId
+) {
+  return nodeId +
+         "-candidate-history-" +
+         ld2410EvidenceBootSessionId +
+         "-" +
+         String(episodeId);
+}
+
+
+static bool enqueueLd2410EpisodeEvidenceTransport(
+  uint32_t newestEpisode,
+  uint32_t nearestEpisode,
+  uint32_t secondNearestEpisode,
+  uint8_t historyCount,
+  uint8_t priorCount,
+  float nearestMeanRelativeDelta,
+  float secondNearestMeanRelativeDelta,
+  float historyMeanRelativeDelta,
+  float historyMinRelativeDelta,
+  float historyMaxRelativeDelta,
+  float historyRange,
+  float absoluteSeparation,
+  float relativeSeparation,
+  float nearestAdvantage,
+  float relativeNearestAdvantage,
+  const float* episodeProfile
+) {
+  if (
+    ld2410EvidenceTransportCount >=
+    LD2410_EVIDENCE_TRANSPORT_QUEUE_CAPACITY
+  ) {
+    ++ld2410EvidenceTransportDropped;
+
+    Serial.printf(
+      "[MMWAVE EVIDENCE TRANSPORT] "
+      "queueFull=1 episode=%lu queueCount=%u dropped=%lu\n",
+      (unsigned long)newestEpisode,
+      (unsigned int)ld2410EvidenceTransportCount,
+      (unsigned long)ld2410EvidenceTransportDropped
+    );
+
+    return false;
+  }
+
+  const uint8_t tail =
+    (
+      ld2410EvidenceTransportHead +
+      ld2410EvidenceTransportCount
+    ) %
+    LD2410_EVIDENCE_TRANSPORT_QUEUE_CAPACITY;
+
+  const String eventId =
+    ld2410EvidenceTransportEventId(newestEpisode);
+
+  const String fullSourceName =
+    deviceName + " - " + roomName;
+
+  String p;
+  p.reserve(1400);
+
+  p += "{";
+  p += "\"protocolVersion\":\"2.0\",";
+  p += "\"evidenceSchemaVersion\":\"1.1\",";
+  p += "\"eventType\":\"candidate_history_evidence\",";
+  p += "\"eventId\":\"" + jsonEscape(eventId) + "\",";
+  p += "\"nodeId\":\"" + jsonEscape(nodeId) + "\",";
+  p += "\"sourceKey\":\"" + jsonEscape(sourceKey) + "\",";
+  p += "\"sourceName\":\"" + jsonEscape(fullSourceName) + "\",";
+  p += "\"deviceType\":\"human_presence\",";
+  p += "\"sensorMode\":\"human_presence\",";
+  p += "\"deviceName\":\"" + jsonEscape(deviceName) + "\",";
+  p += "\"locationName\":\"" + jsonEscape(locationName) + "\",";
+  p += "\"residentName\":\"" + jsonEscape(residentName) + "\",";
+  p += "\"roomName\":\"" + jsonEscape(roomName) + "\",";
+  p += "\"softwareVersion\":\"" + String(SOFTWARE_VERSION) + "\",";
+
+  p += "\"episodeId\":" + String(newestEpisode) + ",";
+  p += "\"historyCount\":" + String(historyCount) + ",";
+  p += "\"priorCount\":" + String(priorCount) + ",";
+  p += "\"dimensions\":10,";
+
+  p += "\"nearestPriorEpisodeId\":" +
+       String(nearestEpisode) + ",";
+
+  p += "\"secondNearestPriorEpisodeId\":" +
+       String(secondNearestEpisode) + ",";
+
+  p += "\"nearestMeanRelativeDelta\":" +
+       String(nearestMeanRelativeDelta, 5) + ",";
+
+  p += "\"secondNearestMeanRelativeDelta\":" +
+       String(secondNearestMeanRelativeDelta, 5) + ",";
+
+  p += "\"historyMeanRelativeDelta\":" +
+       String(historyMeanRelativeDelta, 5) + ",";
+
+  p += "\"historyMinRelativeDelta\":" +
+       String(historyMinRelativeDelta, 5) + ",";
+
+  p += "\"historyMaxRelativeDelta\":" +
+       String(historyMaxRelativeDelta, 5) + ",";
+
+  p += "\"historyRange\":" +
+       String(historyRange, 5) + ",";
+
+  p += "\"absoluteSeparation\":" +
+       String(absoluteSeparation, 5) + ",";
+
+  p += "\"relativeSeparation\":" +
+       String(relativeSeparation, 5) + ",";
+
+  p += "\"nearestAdvantage\":" +
+       String(nearestAdvantage, 5) + ",";
+
+  p += "\"relativeNearestAdvantage\":" +
+       String(relativeNearestAdvantage, 5) + ",";
+
+  // v2.4.2 Evidence Schema 1.1.
+  // Already-computed final candidate profile.
+  p += "\"episodeProfile\":{";
+
+  p += "\"movingPctMean\":" +
+       String(episodeProfile[0], 3) + ",";
+
+  p += "\"stationaryPctMean\":" +
+       String(episodeProfile[1], 3) + ",";
+
+  p += "\"target2PctMean\":" +
+       String(episodeProfile[2], 3) + ",";
+
+  p += "\"target3PctMean\":" +
+       String(episodeProfile[3], 3) + ",";
+
+  p += "\"transitionsMean\":" +
+       String(episodeProfile[4], 3) + ",";
+
+  p += "\"movingDistanceWindowMedianMeanCm\":" +
+       String(episodeProfile[5], 3) + ",";
+
+  p += "\"movingDistanceWindowIqrMeanCm\":" +
+       String(episodeProfile[6], 3) + ",";
+
+  p += "\"stationaryDistanceWindowMedianMeanCm\":" +
+       String(episodeProfile[7], 3) + ",";
+
+  p += "\"stationaryDistanceWindowIqrMeanCm\":" +
+       String(episodeProfile[8], 3) + ",";
+
+  p += "\"detectionDistanceWindowMedianMeanCm\":" +
+       String(episodeProfile[9], 3) + ",";
+
+  p += "\"movingEnergyWindowMedianMean\":" +
+       String(episodeProfile[10], 3) + ",";
+
+  p += "\"stationaryEnergyWindowMedianMean\":" +
+       String(episodeProfile[11], 3);
+
+  p += "},";
+
+  p += "\"observerOnly\":true";
+  p += "}";
+
+  if (
+    p.length() >
+    LD2410_EVIDENCE_TRANSPORT_PAYLOAD_TARGET_BYTES
+  ) {
+    ++ld2410EvidenceTransportDropped;
+
+    Serial.printf(
+      "[MMWAVE EVIDENCE TRANSPORT] "
+      "payloadRejected=1 episode=%lu bytes=%u target=%u dropped=%lu\n",
+      (unsigned long)newestEpisode,
+      (unsigned int)p.length(),
+      (unsigned int)LD2410_EVIDENCE_TRANSPORT_PAYLOAD_TARGET_BYTES,
+      (unsigned long)ld2410EvidenceTransportDropped
+    );
+
+    return false;
+  }
+
+  // Immutable serialized RAM retry snapshot.
+  ld2410EvidenceTransportPayload[tail] = p;
+  ++ld2410EvidenceTransportCount;
+
+  Serial.printf(
+    "[MMWAVE EVIDENCE TRANSPORT] "
+    "enqueued=1 episode=%lu eventId=%s bytes=%u queueCount=%u\n",
+    (unsigned long)newestEpisode,
+    eventId.c_str(),
+    (unsigned int)p.length(),
+    (unsigned int)ld2410EvidenceTransportCount
+  );
+
+  return true;
+}
+
+
+void serviceLd2410EpisodeEvidenceTransport()
+{
+  if (ld2410EvidenceTransportCount == 0) {
+    return;
+  }
+
+  if (!mqtt.connected()) {
+    return;
+  }
+
+  const unsigned long now = millis();
+
+  if (
+    ld2410EvidenceTransportLastAttemptAt != 0 &&
+    now - ld2410EvidenceTransportLastAttemptAt <
+      LD2410_EVIDENCE_TRANSPORT_RETRY_MS
+  ) {
+    return;
+  }
+
+  ld2410EvidenceTransportLastAttemptAt = now;
+
+  String& payload =
+    ld2410EvidenceTransportPayload[
+      ld2410EvidenceTransportHead
+    ];
+
+  const bool ok =
+    mqtt.publish(
+      eventsTopic().c_str(),
+      payload.c_str(),
+      false
+    );
+
+  if (!ok) {
+    ++ld2410EvidenceTransportPublishFailures;
+
+    Serial.printf(
+      "[MMWAVE EVIDENCE TRANSPORT] "
+      "publishFailed=1 queueCount=%u failures=%lu\n",
+      (unsigned int)ld2410EvidenceTransportCount,
+      (unsigned long)ld2410EvidenceTransportPublishFailures
+    );
+
+    return;
+  }
+
+  ++ld2410EvidenceTransportPublished;
+
+  payload = "";
+
+  ld2410EvidenceTransportHead =
+    (
+      ld2410EvidenceTransportHead + 1
+    ) %
+    LD2410_EVIDENCE_TRANSPORT_QUEUE_CAPACITY;
+
+  --ld2410EvidenceTransportCount;
+
+  // Successful send permits immediate oldest-first draining.
+  ld2410EvidenceTransportLastAttemptAt = 0;
+
+  mqtt.loop();
+
+  Serial.printf(
+    "[MMWAVE EVIDENCE TRANSPORT] "
+    "published=1 queueCount=%u publishedCount=%lu\n",
+    (unsigned int)ld2410EvidenceTransportCount,
+    (unsigned long)ld2410EvidenceTransportPublished
+  );
+}
+
+
+void serviceMqtt() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (!mqtt.connected()) {
+    connectMqtt();
+    return;
+  }
+
+  if (!mqtt.loop()) return;
+
+  if (lastStatusPublishAt == 0 ||
+      millis() - lastStatusPublishAt >= MQTT_STATUS_INTERVAL_MS) {
+    publishStatus(true);
+  }
+
+  serviceLd2410EpisodeEvidenceTransport();
+}
+
+
+extern uint8_t ld2410StableState;
+
+void accountLd2410OccupancySession(bool occupied) {
+  static constexpr uint8_t SESSION_STATE_MOVING = 1;
+  static constexpr uint8_t SESSION_STATE_STATIONARY = 2;
+  unsigned long now = millis();
+
+  // Establish the sampling clock without attributing time that
+  // occurred before this accounting layer was initialized.
+  if (ld2410OccupancyLastSampleAt == 0) {
+    ld2410OccupancyLastSampleAt = now;
+
+    if (occupied) {
+      ld2410OccupancySessionActive = true;
+      ld2410OccupancySessionStartedAt = now;
+      ld2410OccupancyMovingMs = 0;
+      ld2410OccupancyStationaryMs = 0;
+    }
+
+    return;
+  }
+
+  unsigned long elapsed =
+    now - ld2410OccupancyLastSampleAt;
+
+  ld2410OccupancyLastSampleAt = now;
+
+  if (ld2410OccupancySessionActive) {
+    // Only UART-confirmed semantic behavior is accumulated.
+    // CLEAR and unknown time remain part of total occupancy duration
+    // but are not falsely classified as moving or stationary.
+    if (ld2410StableState == SESSION_STATE_MOVING) {
+      ld2410OccupancyMovingMs += elapsed;
+    } else if (
+      ld2410StableState == SESSION_STATE_STATIONARY
+    ) {
+      ld2410OccupancyStationaryMs += elapsed;
+    }
+  }
+
+  // GPIO21 rising edge: start a new occupancy session.
+  if (
+    occupied &&
+    !ld2410OccupancySessionActive
+  ) {
+    ld2410OccupancySessionActive = true;
+    ld2410OccupancySessionStartedAt = now;
+    ld2410OccupancyMovingMs = 0;
+    ld2410OccupancyStationaryMs = 0;
+    return;
+  }
+
+  // GPIO21 falling edge: finalize the session before the
+  // existing presence_cleared event is constructed.
+  if (
+    !occupied &&
+    ld2410OccupancySessionActive
+  ) {
+    ld2410CompletedSessionDurationMs =
+      now - ld2410OccupancySessionStartedAt;
+
+    ld2410CompletedMovingMs =
+      ld2410OccupancyMovingMs;
+
+    ld2410CompletedStationaryMs =
+      ld2410OccupancyStationaryMs;
+
+    ld2410CompletedSessionReady = true;
+
+    ld2410OccupancySessionActive = false;
+    ld2410OccupancySessionStartedAt = 0;
+    ld2410OccupancyMovingMs = 0;
+    ld2410OccupancyStationaryMs = 0;
+  }
+}
+
+bool publishPresenceEvent(bool active) {
+  if (!mqtt.connected()) return false;
+
+  String fullSourceName = deviceName + " - " + roomName;
+  String eventType = active ? "presence_detected" : "presence_cleared";
+  String message = active
+    ? "Human presence detected from " + fullSourceName
+    : "Human presence cleared from " + fullSourceName;
+  String timeText = active
+    ? "ESP32 Human Presence Detected Event"
+    : "ESP32 Human Presence Cleared Event";
+
+  String p;
+  p.reserve(700);
+  p += "{";
+  p += "\"protocolVersion\":\"2.0\",";
+  p += "\"nodeId\":\"" + jsonEscape(nodeId) + "\",";
+  p += "\"locationName\":\"" + jsonEscape(locationName) + "\",";
+  p += "\"sourceKey\":\"" + jsonEscape(sourceKey) + "\",";
+  p += "\"sourceName\":\"" + jsonEscape(fullSourceName) + "\",";
+  p += "\"residentName\":\"" + jsonEscape(residentName) + "\",";
+  p += "\"message\":\"" + jsonEscape(message) + "\",";
+  p += "\"alertLevel\":\"Normal\",";
+  p += "\"timeText\":\"" + jsonEscape(timeText) + "\",";
+  p += "\"sensorMode\":\"human_presence\",";
+  p += "\"sensorType\":\"human_presence\",";
+  p += "\"source\":\"ld2410\",";
+  p += "\"eventType\":\"" + eventType + "\",";
+  p += "\"presence\":" + String(active ? "true" : "false");
+
+  // A completed session summary is attached only to the existing
+  // GPIO21 presence_cleared event. No additional event is created.
+  if (
+    !active &&
+    ld2410CompletedSessionReady
+  ) {
+    p += ",";
+    p += "\"sessionDurationMs\":" +
+         String(ld2410CompletedSessionDurationMs) + ",";
+    p += "\"movingDurationMs\":" +
+         String(ld2410CompletedMovingMs) + ",";
+    p += "\"stationaryDurationMs\":" +
+         String(ld2410CompletedStationaryMs) + ",";
+
+    unsigned long classifiedMs =
+      ld2410CompletedMovingMs +
+      ld2410CompletedStationaryMs;
+
+    unsigned long unclassifiedMs =
+      ld2410CompletedSessionDurationMs > classifiedMs
+        ? ld2410CompletedSessionDurationMs - classifiedMs
+        : 0;
+
+    p += "\"unclassifiedDurationMs\":" +
+         String(unclassifiedMs);
+  }
+
+  p += "}";
+
+  bool ok = mqtt.publish(eventsTopic().c_str(), p.c_str(), false);
+
+  if (ok) {
+    mqtt.loop();
+
+    if (
+      !active &&
+      ld2410CompletedSessionReady
+    ) {
+      ld2410CompletedSessionReady = false;
+    }
+  }
+
+  return ok;
+}
+
+uint16_t ld2410ReadUInt16LE(uint8_t low, uint8_t high) {
+  return ((uint16_t)high << 8) | low;
+}
+
+void clearLd2410BufferUpTo(int count) {
+  if (count <= 0) return;
+
+  if (count >= ld2410BufferCount) {
+    ld2410BufferCount = 0;
+    return;
+  }
+
+  for (int i = count; i < ld2410BufferCount; i++) {
+    ld2410Buffer[i - count] = ld2410Buffer[i];
+  }
+
+  ld2410BufferCount -= count;
+}
+
+int findLd2410Header() {
+  for (int i = 0; i <= ld2410BufferCount - 4; i++) {
+    if (ld2410Buffer[i]     == 0xF4 &&
+        ld2410Buffer[i + 1] == 0xF3 &&
+        ld2410Buffer[i + 2] == 0xF2 &&
+        ld2410Buffer[i + 3] == 0xF1) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+void parseLd2410Frame(const uint8_t* frame, int length) {
+  if (length < 23) return;
+
+  // Basic engineering/data frame marker used by the existing
+  // Good Shepherd LD2410 implementation.
+  if (frame[6] != 0x02 || frame[7] != 0xAA) return;
+
+  ld2410TargetState = frame[8];
+  ld2410RadarPresence = ld2410TargetState > 0;
+
+  ld2410MovingTarget =
+    ld2410TargetState == 1 || ld2410TargetState == 3;
+
+  ld2410StationaryTarget =
+    ld2410TargetState == 2 || ld2410TargetState == 3;
+
+  ld2410MovingDistanceCm =
+    ld2410ReadUInt16LE(frame[9], frame[10]);
+
+  ld2410MovingEnergy = frame[11];
+
+  ld2410StationaryDistanceCm =
+    ld2410ReadUInt16LE(frame[12], frame[13]);
+
+  ld2410StationaryEnergy = frame[14];
+
+  ld2410DetectionDistanceCm =
+    ld2410ReadUInt16LE(frame[17], frame[18]);
+
+  ld2410ParsedFrameCount++;
+  lastLd2410FrameAt = millis();
+
+  // v2.4.4 observer-only high-resolution capture.
+  //
+  // Capture immediately after the validated parser has refreshed
+  // the raw LD2410 measurements, but only while explicitly enabled
+  // through the existing MQTT command channel.
+  //
+  // This does not feed back into the parser, feature extractor,
+  // baseline, candidate, or episode state.
+  if (
+    ld2410HighResolutionEnabled &&
+    ld2410HighResolutionBatchCount <
+    LD2410_HIGH_RES_BATCH_CAPACITY
+  ) {
+    Ld2410HighResolutionSample& sample =
+      ld2410HighResolutionBatch[
+        ld2410HighResolutionBatchCount
+      ];
+
+    sample.frameSequence =
+      (uint32_t)ld2410ParsedFrameCount;
+
+    sample.uptimeMs =
+      lastLd2410FrameAt;
+
+    sample.targetState =
+      ld2410TargetState;
+
+    sample.radarPresence =
+      ld2410RadarPresence;
+
+    sample.movingTarget =
+      ld2410MovingTarget;
+
+    sample.movingDistanceCm =
+      ld2410MovingDistanceCm;
+
+    sample.movingEnergy =
+      ld2410MovingEnergy;
+
+    sample.stationaryTarget =
+      ld2410StationaryTarget;
+
+    sample.stationaryDistanceCm =
+      ld2410StationaryDistanceCm;
+
+    sample.stationaryEnergy =
+      ld2410StationaryEnergy;
+
+    sample.detectionDistanceCm =
+      ld2410DetectionDistanceCm;
+
+    sample.stablePresenceState =
+      ld2410StableState;
+
+    if (ld2410HighResolutionBatchCount == 0) {
+      ld2410HighResolutionBatchStartedAt =
+        lastLd2410FrameAt;
+    }
+
+    ++ld2410HighResolutionBatchCount;
+
+  } else if (ld2410HighResolutionEnabled) {
+    // Development evidence loss is allowed by contract.
+    // Never block or modify operational sensor behavior.
+    ++ld2410HighResolutionDroppedSamples;
+  }
+}
+
+void processLd2410Buffer() {
+  while (ld2410BufferCount >= 10) {
+    int headerIndex = findLd2410Header();
+
+    if (headerIndex < 0) {
+      if (ld2410BufferCount > 3) {
+        clearLd2410BufferUpTo(ld2410BufferCount - 3);
+      }
+      return;
+    }
+
+    if (headerIndex > 0) {
+      clearLd2410BufferUpTo(headerIndex);
+    }
+
+    if (ld2410BufferCount < 10) return;
+
+    uint16_t payloadLength =
+      ld2410ReadUInt16LE(ld2410Buffer[4], ld2410Buffer[5]);
+
+    int totalFrameLength = 4 + 2 + payloadLength + 4;
+
+    if (totalFrameLength < 10 ||
+        totalFrameLength > LD2410_BUFFER_SIZE) {
+      clearLd2410BufferUpTo(1);
+      continue;
+    }
+
+    if (ld2410BufferCount < totalFrameLength) return;
+
+    bool hasTail =
+      ld2410Buffer[totalFrameLength - 4] == 0xF8 &&
+      ld2410Buffer[totalFrameLength - 3] == 0xF7 &&
+      ld2410Buffer[totalFrameLength - 2] == 0xF6 &&
+      ld2410Buffer[totalFrameLength - 1] == 0xF5;
+
+    if (!hasTail) {
+      clearLd2410BufferUpTo(1);
+      continue;
+    }
+
+    parseLd2410Frame(ld2410Buffer, totalFrameLength);
+    clearLd2410BufferUpTo(totalFrameLength);
+  }
+}
+
+void publishLd2410Diagnostic() {
+  if (!LD2410_RAW_DIAGNOSTIC_ENABLED) return;
+  if (!mqtt.connected()) return;
+
+  // Development-only: once per second maximum when explicitly enabled.
+  if (millis() - lastLd2410DiagnosticAt < 1000UL) return;
+  lastLd2410DiagnosticAt = millis();
+
+  String topic =
+    "good-shepherd/v2/nodes/" + nodeId +
+    "/diagnostics/ld2410";
+
+  String payload;
+  payload.reserve(400);
+
+  payload += "{";
+
+  payload += "\"gpio21\":";
+  payload +=
+    digitalRead(PRESENCE_PIN) == PRESENCE_ACTIVE_STATE
+      ? "true" : "false";
+
+  payload += ",\"uartAlive\":";
+  payload += lastLd2410FrameAt > 0 ? "true" : "false";
+
+  payload += ",\"uartAgeMs\":";
+  payload += lastLd2410FrameAt > 0
+    ? String(millis() - lastLd2410FrameAt)
+    : String(-1);
+
+  payload += ",\"bytesReceived\":";
+  payload += String(ld2410TotalBytesReceived);
+
+  payload += ",\"parsedFrames\":";
+  payload += String(ld2410ParsedFrameCount);
+
+  payload += ",\"radarPresence\":";
+  payload += ld2410RadarPresence ? "true" : "false";
+
+  payload += ",\"targetState\":";
+  payload += String(ld2410TargetState);
+
+  payload += ",\"movingTarget\":";
+  payload += ld2410MovingTarget ? "true" : "false";
+
+  payload += ",\"movingDistanceCm\":";
+  payload += String(ld2410MovingDistanceCm);
+
+  payload += ",\"movingEnergy\":";
+  payload += String(ld2410MovingEnergy);
+
+  payload += ",\"stationaryTarget\":";
+  payload += ld2410StationaryTarget ? "true" : "false";
+
+  payload += ",\"stationaryDistanceCm\":";
+  payload += String(ld2410StationaryDistanceCm);
+
+  payload += ",\"stationaryEnergy\":";
+  payload += String(ld2410StationaryEnergy);
+
+  payload += ",\"detectionDistanceCm\":";
+  payload += String(ld2410DetectionDistanceCm);
+
+  payload += "}";
+
+  // Retained only for development visibility in MQTT Explorer.
+  mqtt.publish(topic.c_str(), payload.c_str(), true);
+}
+
+
+// -----------------------------------------------------------------------------
+// LD2410 locally interpreted presence state
+//
+// The radar produces roughly 10 frames/second. These frames remain local.
+// MQTT publishes only when a stable semantic state changes.
+//
+// targetState:
+//   0 = clear
+//   1 = moving
+//   2 = stationary
+//   3 = moving + stationary
+//
+// For Good Shepherd semantics, state 3 is treated as MOVING because active
+// movement is occurring.
+// -----------------------------------------------------------------------------
+
+static constexpr uint8_t LD2410_STATE_CLEAR = 0;
+static constexpr uint8_t LD2410_STATE_MOVING = 1;
+static constexpr uint8_t LD2410_STATE_STATIONARY = 2;
+
+static constexpr unsigned long LD2410_STATE_DEBOUNCE_MS = 1000UL;
+
+// DEVELOPMENT VALIDATION THRESHOLD.
+// Intentionally short so prolonged-stationary behavior can be
+// validated quickly. This is NOT the eventual production threshold.
+static constexpr unsigned long
+  LD2410_PROLONGED_STATIONARY_MS = 15000UL;
+
+// v2.3.2 DEVELOPMENT CALIBRATION VALUES.
+// These classify stationary-distance behavior for observation only.
+// They are NOT care thresholds and are NOT fall-detection rules.
+static constexpr uint16_t
+  LD2410_DISTANCE_STABLE_RANGE_CM = 30;
+
+static constexpr uint16_t
+  LD2410_DISTANCE_DRIFT_CM = 40;
+
+static constexpr uint16_t
+  LD2410_DISTANCE_MIN_SAMPLES = 20;
+
+bool ld2410ProlongedStationaryReported = false;
+
+// v2.3.2 stationary-distance evidence.
+// Samples are collected locally only while:
+//   1. GPIO21 says the occupancy session is active, and
+//   2. the stable LD2410 semantic state is stationary.
+//
+// No periodic MQTT telemetry is generated.
+uint32_t ld2410StationaryDistanceSampleCount = 0;
+uint64_t ld2410StationaryDistanceSumCm = 0;
+uint16_t ld2410StationaryDistanceMinCm = 0;
+uint16_t ld2410StationaryDistanceMaxCm = 0;
+uint16_t ld2410StationaryDistanceFirstCm = 0;
+uint16_t ld2410StationaryDistanceLastCm = 0;
+unsigned long ld2410LastDistanceSampleFrameAt = 0;
+
+uint8_t ld2410CandidateState = LD2410_STATE_CLEAR;
+uint8_t ld2410StableState = LD2410_STATE_CLEAR;
+
+unsigned long ld2410CandidateSince = 0;
+unsigned long ld2410StableStateStartedAt = 0;
+
+bool ld2410StateInitialized = false;
+int ld2410LastPublishedState = -1;
+
+const char* ld2410PresenceStateName(uint8_t state) {
+  switch (state) {
+    case LD2410_STATE_MOVING:
+      return "moving";
+
+    case LD2410_STATE_STATIONARY:
+      return "stationary";
+
+    case LD2410_STATE_CLEAR:
+    default:
+      return "clear";
+  }
+}
+
+uint8_t classifyLd2410PresenceState() {
+  if (!ld2410RadarPresence || ld2410TargetState == 0) {
+    return LD2410_STATE_CLEAR;
+  }
+
+  if (ld2410MovingTarget) {
+    return LD2410_STATE_MOVING;
+  }
+
+  if (ld2410StationaryTarget) {
+    return LD2410_STATE_STATIONARY;
+  }
+
+  return LD2410_STATE_CLEAR;
+}
+
+
+bool publishLd2410BehaviorEvent(
+  uint8_t state,
+  uint8_t previousState,
+  unsigned long previousStateDurationMs,
+  unsigned long occupancyAgeMs
+) {
+  if (!mqtt.connected()) {
+    return false;
+  }
+
+  if (
+    state != LD2410_STATE_MOVING &&
+    state != LD2410_STATE_STATIONARY
+  ) {
+    return false;
+  }
+
+  String fullSourceName =
+    deviceName + " - " + roomName;
+
+  String eventType =
+    state == LD2410_STATE_MOVING
+      ? "presence_moving"
+      : "presence_stationary";
+
+  String message =
+    state == LD2410_STATE_MOVING
+      ? "Human presence moving at " + fullSourceName
+      : "Human presence stationary at " + fullSourceName;
+
+  String timeText =
+    state == LD2410_STATE_MOVING
+      ? "ESP32 Human Presence Moving Event"
+      : "ESP32 Human Presence Stationary Event";
+
+  uint16_t selectedDistanceCm = 0;
+  uint8_t selectedEnergy = 0;
+
+  if (state == LD2410_STATE_MOVING) {
+    selectedDistanceCm = ld2410MovingDistanceCm;
+    selectedEnergy = ld2410MovingEnergy;
+  } else {
+    selectedDistanceCm = ld2410StationaryDistanceCm;
+    selectedEnergy = ld2410StationaryEnergy;
+  }
+
+  String p;
+  p.reserve(900);
+
+  p += "{";
+  p += "\"protocolVersion\":\"2.0\",";
+  p += "\"nodeId\":\"" + jsonEscape(nodeId) + "\",";
+  p += "\"locationName\":\"" + jsonEscape(locationName) + "\",";
+  p += "\"sourceKey\":\"" + jsonEscape(sourceKey) + "\",";
+  p += "\"sourceName\":\"" + jsonEscape(fullSourceName) + "\",";
+  p += "\"residentName\":\"" + jsonEscape(residentName) + "\",";
+  p += "\"message\":\"" + jsonEscape(message) + "\",";
+  p += "\"alertLevel\":\"Normal\",";
+  p += "\"timeText\":\"" + jsonEscape(timeText) + "\",";
+  p += "\"sensorMode\":\"human_presence\",";
+  p += "\"sensorType\":\"human_presence\",";
+  p += "\"source\":\"ld2410\",";
+  p += "\"eventType\":\"" + eventType + "\",";
+  p += "\"presence\":true,";
+
+  p += "\"presenceState\":\"";
+  p += ld2410PresenceStateName(state);
+  p += "\",";
+
+  p += "\"previousPresenceState\":\"";
+  p += ld2410PresenceStateName(previousState);
+  p += "\",";
+
+  p += "\"previousStateDurationMs\":";
+  p += String(previousStateDurationMs);
+  p += ",";
+
+  p += "\"occupancyAgeMs\":";
+  p += String(occupancyAgeMs);
+  p += ",";
+
+  p += "\"targetState\":";
+  p += String(ld2410TargetState);
+  p += ",";
+
+  p += "\"distanceCm\":";
+  p += String(selectedDistanceCm);
+  p += ",";
+
+  p += "\"energy\":";
+  p += String(selectedEnergy);
+
+  p += "}";
+
+  bool ok =
+    mqtt.publish(
+      eventsTopic().c_str(),
+      p.c_str(),
+      false
+    );
+
+  if (ok) {
+    mqtt.loop();
+  }
+
+  return ok;
+}
+
+
+
+
+void resetLd2410StationaryDistanceEvidence() {
+  ld2410StationaryDistanceSampleCount = 0;
+  ld2410StationaryDistanceSumCm = 0;
+  ld2410StationaryDistanceMinCm = 0;
+  ld2410StationaryDistanceMaxCm = 0;
+  ld2410StationaryDistanceFirstCm = 0;
+  ld2410StationaryDistanceLastCm = 0;
+  ld2410LastDistanceSampleFrameAt = 0;
+}
+
+
+void sampleLd2410StationaryDistanceEvidence() {
+  // Only use a newly parsed UART frame. serviceLd2410Uart() can execute
+  // many times between radar frames, and repeatedly counting the same
+  // measurement would distort the evidence.
+  if (
+    lastLd2410FrameAt == 0 ||
+    lastLd2410FrameAt == ld2410LastDistanceSampleFrameAt
+  ) {
+    return;
+  }
+
+  ld2410LastDistanceSampleFrameAt = lastLd2410FrameAt;
+
+  uint16_t distanceCm = ld2410StationaryDistanceCm;
+
+  // Zero is not useful as stationary-distance evidence.
+  if (distanceCm == 0) {
+    return;
+  }
+
+  if (ld2410StationaryDistanceSampleCount == 0) {
+    ld2410StationaryDistanceFirstCm = distanceCm;
+    ld2410StationaryDistanceMinCm = distanceCm;
+    ld2410StationaryDistanceMaxCm = distanceCm;
+  }
+
+  if (distanceCm < ld2410StationaryDistanceMinCm) {
+    ld2410StationaryDistanceMinCm = distanceCm;
+  }
+
+  if (distanceCm > ld2410StationaryDistanceMaxCm) {
+    ld2410StationaryDistanceMaxCm = distanceCm;
+  }
+
+  ld2410StationaryDistanceLastCm = distanceCm;
+  ld2410StationaryDistanceSumCm += distanceCm;
+  ld2410StationaryDistanceSampleCount++;
+}
+
+
+uint16_t ld2410StationaryDistanceRangeCm() {
+  if (ld2410StationaryDistanceSampleCount == 0) {
+    return 0;
+  }
+
+  return
+    ld2410StationaryDistanceMaxCm -
+    ld2410StationaryDistanceMinCm;
+}
+
+
+uint16_t ld2410StationaryDistanceAverageCm() {
+  if (ld2410StationaryDistanceSampleCount == 0) {
+    return 0;
+  }
+
+  return (uint16_t)(
+    ld2410StationaryDistanceSumCm /
+    ld2410StationaryDistanceSampleCount
+  );
+}
+
+
+long ld2410StationaryDistanceDeltaCm() {
+  if (ld2410StationaryDistanceSampleCount == 0) {
+    return 0;
+  }
+
+  return
+    (long)ld2410StationaryDistanceLastCm -
+    (long)ld2410StationaryDistanceFirstCm;
+}
+
+
+const char* classifyLd2410StationaryDistanceStability() {
+  if (
+    ld2410StationaryDistanceSampleCount <
+    LD2410_DISTANCE_MIN_SAMPLES
+  ) {
+    return "insufficient";
+  }
+
+  uint16_t rangeCm =
+    ld2410StationaryDistanceRangeCm();
+
+  long deltaCm =
+    ld2410StationaryDistanceDeltaCm();
+
+  unsigned long absoluteDeltaCm =
+    deltaCm < 0
+      ? (unsigned long)(-deltaCm)
+      : (unsigned long)deltaCm;
+
+  if (
+    rangeCm <= LD2410_DISTANCE_STABLE_RANGE_CM &&
+    absoluteDeltaCm <= LD2410_DISTANCE_STABLE_RANGE_CM
+  ) {
+    return "stable";
+  }
+
+  if (
+    absoluteDeltaCm >= LD2410_DISTANCE_DRIFT_CM
+  ) {
+    return "drifting";
+  }
+
+  return "variable";
+}
+
+
+bool publishLd2410ProlongedStationaryEvent(
+  unsigned long stationaryDurationMs,
+  unsigned long occupancyAgeMs
+) {
+  if (!mqtt.connected()) {
+    return false;
+  }
+
+  String fullSourceName =
+    deviceName + " - " + roomName;
+
+  String p;
+  p.reserve(950);
+
+  p += "{";
+  p += "\"protocolVersion\":\"2.0\",";
+  p += "\"nodeId\":\"" + jsonEscape(nodeId) + "\",";
+  p += "\"locationName\":\"" + jsonEscape(locationName) + "\",";
+  p += "\"sourceKey\":\"" + jsonEscape(sourceKey) + "\",";
+  p += "\"sourceName\":\"" + jsonEscape(fullSourceName) + "\",";
+  p += "\"residentName\":\"" + jsonEscape(residentName) + "\",";
+  p += "\"message\":\"" +
+       jsonEscape(
+         "Human presence continuously stationary at " +
+         fullSourceName
+       ) +
+       "\",";
+  p += "\"alertLevel\":\"Normal\",";
+  p += "\"timeText\":\"ESP32 Prolonged Stationary Presence Event\",";
+  p += "\"sensorMode\":\"human_presence\",";
+  p += "\"sensorType\":\"human_presence\",";
+  p += "\"source\":\"ld2410\",";
+  p += "\"eventType\":\"presence_stationary_prolonged\",";
+  p += "\"presence\":true,";
+  p += "\"presenceState\":\"stationary\",";
+  p += "\"stationaryDurationMs\":" +
+       String(stationaryDurationMs) + ",";
+  p += "\"occupancyAgeMs\":" +
+       String(occupancyAgeMs) + ",";
+
+  // v2.3.2 local stationary-distance evidence.
+  // These fields are observational context only.
+  p += "\"distanceStability\":\"" +
+       String(classifyLd2410StationaryDistanceStability()) +
+       "\",";
+
+  p += "\"distanceSampleCount\":" +
+       String(ld2410StationaryDistanceSampleCount) + ",";
+
+  p += "\"distanceFirstCm\":" +
+       String(ld2410StationaryDistanceFirstCm) + ",";
+
+  p += "\"distanceLastCm\":" +
+       String(ld2410StationaryDistanceLastCm) + ",";
+
+  p += "\"distanceMinCm\":" +
+       String(ld2410StationaryDistanceMinCm) + ",";
+
+  p += "\"distanceMaxCm\":" +
+       String(ld2410StationaryDistanceMaxCm) + ",";
+
+  p += "\"distanceAverageCm\":" +
+       String(ld2410StationaryDistanceAverageCm()) + ",";
+
+  p += "\"distanceRangeCm\":" +
+       String(ld2410StationaryDistanceRangeCm()) + ",";
+
+  p += "\"distanceDeltaCm\":" +
+       String(ld2410StationaryDistanceDeltaCm()) + ",";
+
+  p += "\"targetState\":" +
+       String(ld2410TargetState) + ",";
+  p += "\"distanceCm\":" +
+       String(ld2410StationaryDistanceCm) + ",";
+  p += "\"energy\":" +
+       String(ld2410StationaryEnergy);
+  p += "}";
+
+  bool ok =
+    mqtt.publish(
+      eventsTopic().c_str(),
+      p.c_str(),
+      false
+    );
+
+  if (ok) {
+    mqtt.loop();
+  }
+
+  return ok;
+}
+
+
+void serviceLd2410ProlongedStationary() {
+  // GPIO21 remains authoritative for whether an occupancy session
+  // actually exists.
+  if (
+    ld2410StableState != LD2410_STATE_STATIONARY ||
+    !ld2410OccupancySessionActive
+  ) {
+    ld2410ProlongedStationaryReported = false;
+    resetLd2410StationaryDistanceEvidence();
+    return;
+  }
+
+  // Collect one sample per newly parsed LD2410 UART frame.
+  sampleLd2410StationaryDistanceEvidence();
+
+  // One event maximum per continuous stationary episode.
+  if (ld2410ProlongedStationaryReported) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  unsigned long stateAgeMs =
+    ld2410StableStateStartedAt > 0
+      ? now - ld2410StableStateStartedAt
+      : 0;
+
+  unsigned long occupancyAgeMs =
+    ld2410OccupancySessionStartedAt > 0
+      ? now - ld2410OccupancySessionStartedAt
+      : 0;
+
+  // Require both the semantic stationary state and the GPIO21
+  // occupancy session to have persisted for the threshold.
+  unsigned long effectiveStationaryMs =
+    stateAgeMs < occupancyAgeMs
+      ? stateAgeMs
+      : occupancyAgeMs;
+
+  if (
+    effectiveStationaryMs <
+    LD2410_PROLONGED_STATIONARY_MS
+  ) {
+    return;
+  }
+
+  if (
+    publishLd2410ProlongedStationaryEvent(
+      effectiveStationaryMs,
+      occupancyAgeMs
+    )
+  ) {
+    ld2410ProlongedStationaryReported = true;
+  }
+}
+
+
+void publishLd2410PresenceState() {
+  if (!PRESENCE_STATE_DIAGNOSTIC_ENABLED) {
+    return;
+  }
+
+  if (!mqtt.connected()) {
+    return;
+  }
+
+  if (ld2410LastPublishedState == (int)ld2410StableState) {
+    return;
+  }
+
+  ld2410LastPublishedState = (int)ld2410StableState;
+
+  uint16_t selectedDistanceCm = 0;
+  uint8_t selectedEnergy = 0;
+
+  if (ld2410StableState == LD2410_STATE_MOVING) {
+    selectedDistanceCm = ld2410MovingDistanceCm;
+    selectedEnergy = ld2410MovingEnergy;
+  } else if (ld2410StableState == LD2410_STATE_STATIONARY) {
+    selectedDistanceCm = ld2410StationaryDistanceCm;
+    selectedEnergy = ld2410StationaryEnergy;
+  }
+
+  unsigned long uartAgeMs =
+    lastLd2410FrameAt > 0
+      ? millis() - lastLd2410FrameAt
+      : 0;
+
+  bool uartAlive =
+    lastLd2410FrameAt > 0 &&
+    uartAgeMs < 2000UL;
+
+  String topic =
+    "good-shepherd/v2/nodes/" +
+    nodeId +
+    "/diagnostics/presence_state";
+
+  String payload = "{";
+
+  payload += "\"state\":\"";
+  payload += ld2410PresenceStateName(ld2410StableState);
+  payload += "\",";
+
+  payload += "\"gpio21\":";
+  payload +=
+    digitalRead(PRESENCE_PIN) == PRESENCE_ACTIVE_STATE
+      ? "true"
+      : "false";
+  payload += ",";
+
+  payload += "\"radarPresence\":";
+  payload += ld2410RadarPresence ? "true" : "false";
+  payload += ",";
+
+  payload += "\"targetState\":";
+  payload += String(ld2410TargetState);
+  payload += ",";
+
+  payload += "\"distanceCm\":";
+  payload += String(selectedDistanceCm);
+  payload += ",";
+
+  payload += "\"energy\":";
+  payload += String(selectedEnergy);
+  payload += ",";
+
+  payload += "\"uartAlive\":";
+  payload += uartAlive ? "true" : "false";
+  payload += ",";
+
+  payload += "\"uartAgeMs\":";
+  payload += String(uartAgeMs);
+
+  payload += "}";
+
+  mqtt.publish(
+    topic.c_str(),
+    payload.c_str(),
+    true
+  );
+
+  Serial.printf(
+    "[LD2410 STATE] %s target=%u distance=%u energy=%u\n",
+    ld2410PresenceStateName(ld2410StableState),
+    ld2410TargetState,
+    selectedDistanceCm,
+    selectedEnergy
+  );
+}
+
+void serviceLd2410PresenceState() {
+  uint8_t observed =
+    classifyLd2410PresenceState();
+
+  unsigned long now = millis();
+
+  if (!ld2410StateInitialized) {
+    ld2410StateInitialized = true;
+    ld2410CandidateState = observed;
+    ld2410StableState = observed;
+    ld2410CandidateSince = now;
+    ld2410StableStateStartedAt = now;
+
+    publishLd2410PresenceState();
+    return;
+  }
+
+  if (observed != ld2410CandidateState) {
+    ld2410CandidateState = observed;
+    ld2410CandidateSince = now;
+    return;
+  }
+
+  if (
+    ld2410CandidateState != ld2410StableState &&
+    now - ld2410CandidateSince >= LD2410_STATE_DEBOUNCE_MS
+  ) {
+    uint8_t previousState = ld2410StableState;
+
+    unsigned long previousStateDurationMs =
+      ld2410StableStateStartedAt > 0
+        ? now - ld2410StableStateStartedAt
+        : 0;
+
+    unsigned long occupancyAgeMs =
+      ld2410OccupancySessionActive &&
+      ld2410OccupancySessionStartedAt > 0
+        ? now - ld2410OccupancySessionStartedAt
+        : 0;
+
+    ld2410StableState = ld2410CandidateState;
+    ld2410StableStateStartedAt = now;
+
+    publishLd2410PresenceState();
+
+    // GPIO21 remains authoritative for coarse occupancy boundaries.
+    // UART contributes only moving/stationary behavioral context.
+    publishLd2410BehaviorEvent(
+      ld2410StableState,
+      previousState,
+      previousStateDurationMs,
+      occupancyAgeMs
+    );
+  }
+}
+
+
+
+// ============================================================
+// v2.3.2 DEVELOPMENT-ONLY LOCAL mmWAVE FEATURE EXTRACTOR
+//
+// Purpose:
+//   Convert the raw ~10 Hz LD2410 UART stream into a compact
+//   rolling behavioral feature vector.
+//
+// This is LOCAL / SERIAL validation only:
+//   - no MQTT topic
+//   - no new event
+//   - no alert classification
+//   - no adaptive baseline yet
+//   - GPIO21 remains occupancy authority
+//
+// The window is intentionally short. These are measurements,
+// not care decisions or fall-detection thresholds.
+// ============================================================
+
+static constexpr bool
+  LD2410_FEATURE_SERIAL_ENABLED = true;
+
+static constexpr unsigned long
+  LD2410_FEATURE_SERIAL_INTERVAL_MS = 1000UL;
+
+static constexpr uint8_t
+  LD2410_FEATURE_WINDOW_SIZE = 30;
+
+struct Ld2410FeatureSample {
+  uint8_t targetState;
+  bool moving;
+  bool stationary;
+  uint16_t movingDistanceCm;
+  uint8_t movingEnergy;
+  uint16_t stationaryDistanceCm;
+  uint8_t stationaryEnergy;
+  uint16_t detectionDistanceCm;
+};
+
+Ld2410FeatureSample
+  ld2410FeatureSamples[LD2410_FEATURE_WINDOW_SIZE];
+
+uint8_t ld2410FeatureCount = 0;
+uint8_t ld2410FeatureWriteIndex = 0;
+
+unsigned long ld2410FeatureLastFrameAt = 0;
+unsigned long ld2410FeatureLastSerialAt = 0;
+
+static void sortUint16(uint16_t* values, uint8_t count) {
+  for (uint8_t i = 1; i < count; ++i) {
+    uint16_t key = values[i];
+    int j = i - 1;
+
+    while (j >= 0 && values[j] > key) {
+      values[j + 1] = values[j];
+      --j;
+    }
+
+    values[j + 1] = key;
+  }
+}
+
+static void sortUint8(uint8_t* values, uint8_t count) {
+  for (uint8_t i = 1; i < count; ++i) {
+    uint8_t key = values[i];
+    int j = i - 1;
+
+    while (j >= 0 && values[j] > key) {
+      values[j + 1] = values[j];
+      --j;
+    }
+
+    values[j + 1] = key;
+  }
+}
+
+static uint16_t medianUint16(
+  uint16_t* values,
+  uint8_t count
+) {
+  if (count == 0) return 0;
+
+  sortUint16(values, count);
+
+  if (count & 1) {
+    return values[count / 2];
+  }
+
+  return (
+    (uint32_t)values[(count / 2) - 1] +
+    (uint32_t)values[count / 2]
+  ) / 2;
+}
+
+static uint8_t medianUint8(
+  uint8_t* values,
+  uint8_t count
+) {
+  if (count == 0) return 0;
+
+  sortUint8(values, count);
+
+  if (count & 1) {
+    return values[count / 2];
+  }
+
+  return (
+    (uint16_t)values[(count / 2) - 1] +
+    (uint16_t)values[count / 2]
+  ) / 2;
+}
+
+static uint16_t iqrUint16(
+  uint16_t* values,
+  uint8_t count
+) {
+  if (count < 4) return 0;
+
+  sortUint16(values, count);
+
+  uint8_t q1Index = count / 4;
+  uint8_t q3Index = (count * 3) / 4;
+
+  return (
+    values[q3Index] >= values[q1Index]
+      ? values[q3Index] - values[q1Index]
+      : 0
+  );
+}
+
+static uint8_t featureChronologicalIndex(
+  uint8_t position
+) {
+  if (ld2410FeatureCount < LD2410_FEATURE_WINDOW_SIZE) {
+    return position;
+  }
+
+  return (
+    ld2410FeatureWriteIndex + position
+  ) % LD2410_FEATURE_WINDOW_SIZE;
+}
+
+void sampleLd2410FeatureWindow() {
+  // One feature sample maximum per newly parsed UART frame.
+  if (
+    lastLd2410FrameAt == 0 ||
+    lastLd2410FrameAt == ld2410FeatureLastFrameAt
+  ) {
+    return;
+  }
+
+  ld2410FeatureLastFrameAt = lastLd2410FrameAt;
+
+  Ld2410FeatureSample& sample =
+    ld2410FeatureSamples[ld2410FeatureWriteIndex];
+
+  sample.targetState = ld2410TargetState;
+  sample.moving = ld2410MovingTarget;
+  sample.stationary = ld2410StationaryTarget;
+
+  sample.movingDistanceCm =
+    ld2410MovingDistanceCm;
+
+  sample.movingEnergy =
+    ld2410MovingEnergy;
+
+  sample.stationaryDistanceCm =
+    ld2410StationaryDistanceCm;
+
+  sample.stationaryEnergy =
+    ld2410StationaryEnergy;
+
+  sample.detectionDistanceCm =
+    ld2410DetectionDistanceCm;
+
+  ld2410FeatureWriteIndex =
+    (ld2410FeatureWriteIndex + 1) %
+    LD2410_FEATURE_WINDOW_SIZE;
+
+  if (ld2410FeatureCount < LD2410_FEATURE_WINDOW_SIZE) {
+    ++ld2410FeatureCount;
+  }
+}
+
+
+// ============================================================
+// v2.3.3 DEVELOPMENT-ONLY ADAPTIVE BASELINE OBSERVER
+//
+// This layer learns the normal distribution of the rolling
+// mmWave feature vector for this sensor installation.
+//
+// IMPORTANT:
+//   - RAM only; reboot resets learning.
+//   - No MQTT publication.
+//   - No event generation.
+//   - No anomaly decision.
+//   - No fall/emergency interpretation.
+//   - GPIO21 occupancy remains authoritative.
+//   - A full rolling feature window is required.
+//
+// The observer uses a slow exponentially weighted update.
+// The mean captures the local normal level. The deviation
+// captures normal variability around that level.
+// ============================================================
+
+static constexpr float
+  LD2410_BASELINE_ALPHA = 0.02f;
+
+// v2.3.4 DEVELOPMENT-ONLY protected learning.
+//
+// Strongly unusual windows are not allowed to move the baseline
+// at full speed. They receive a much smaller learning rate.
+//
+// These values are behavioral-learning safeguards only.
+// They are NOT care, fall, or emergency thresholds.
+static constexpr float
+  LD2410_BASELINE_OUTLIER_ALPHA = 0.002f;
+
+static constexpr float
+  LD2410_BASELINE_OUTLIER_SCORE = 4.0f;
+
+static constexpr float
+  LD2410_BASELINE_EXTREME_SCORE = 8.0f;
+
+// Minimum deviation floors prevent a temporarily tiny learned
+// deviation from making ordinary variation look mathematically huge.
+static constexpr float
+  LD2410_BASELINE_MOVE_DEV_FLOOR = 8.0f;
+
+static constexpr float
+  LD2410_BASELINE_FLIPS_DEV_FLOOR = 1.5f;
+
+static constexpr float
+  LD2410_BASELINE_DISTANCE_DEV_FLOOR = 20.0f;
+
+static constexpr float
+  LD2410_BASELINE_IQR_DEV_FLOOR = 15.0f;
+
+static constexpr float
+  LD2410_BASELINE_DETECTION_DEV_FLOOR = 25.0f;
+
+static constexpr uint32_t
+  LD2410_BASELINE_WARMUP_WINDOWS = 30;
+
+static constexpr unsigned long
+  LD2410_BASELINE_SERIAL_INTERVAL_MS = 5000UL;
+
+struct Ld2410AdaptiveMetric {
+  float mean;
+  float deviation;
+};
+
+bool ld2410BaselineInitialized = false;
+uint32_t ld2410BaselineWindowCount = 0;
+unsigned long ld2410BaselineLastSerialAt = 0;
+
+// Protected-learning observer state.
+uint32_t ld2410BaselineFullRateWindows = 0;
+uint32_t ld2410BaselineDownweightedWindows = 0;
+
+uint8_t ld2410BaselineLastOutlierDimensions = 0;
+float ld2410BaselineLastMaxOutlierScore = 0.0f;
+float ld2410BaselineLastAppliedAlpha = LD2410_BASELINE_ALPHA;
+
+bool ld2410BaselineLastWindowDownweighted = false;
+
+// ============================================================
+// v2.3.8 DEVELOPMENT-ONLY ADAPTATION ELIGIBILITY ENFORCEMENT
+//
+// normal_learning:
+//   Preserve existing v2.3.4 protected-learning behavior.
+//
+// protected_episode:
+//   Force the already-validated protected alpha (0.002).
+//
+// persistent_candidate:
+//   Freeze adaptive-baseline learning for the current window.
+//
+// This is a local development learning-policy experiment.
+// It is NOT a care/fall/emergency threshold or production rule.
+// ============================================================
+
+static constexpr float
+  LD2410_BASELINE_PERSISTENT_ALPHA = 0.0f;
+
+uint32_t ld2410BaselineEligibilityProtectedWindows = 0;
+uint32_t ld2410BaselineEligibilityFrozenWindows = 0;
+
+bool ld2410BaselineLastEligibilityProtected = false;
+bool ld2410BaselineLastEligibilityFrozen = false;
+
+// ============================================================
+// v2.3.9 DEVELOPMENT-ONLY QUARANTINED CANDIDATE BASELINE
+//
+// The trusted baseline remains authoritative and is NOT modified
+// by this observer.
+//
+// A separate RAM-only candidate profile learns only while the
+// adaptation eligibility state is persistent_candidate.
+//
+// When the persistent episode ends, the candidate is HELD.
+// Nothing is automatically promoted into the trusted baseline.
+//
+// These states are adaptation-development context only.
+// They are NOT care, fall, or emergency classifications.
+// ============================================================
+
+static constexpr uint8_t
+  LD2410_CANDIDATE_STATE_INACTIVE = 0;
+
+static constexpr uint8_t
+  LD2410_CANDIDATE_STATE_LEARNING = 1;
+
+static constexpr uint8_t
+  LD2410_CANDIDATE_STATE_HELD = 2;
+
+static constexpr float
+  LD2410_CANDIDATE_ALPHA = 0.02f;
+
+static constexpr unsigned long
+  LD2410_CANDIDATE_SERIAL_INTERVAL_MS = 1000UL;
+
+uint8_t ld2410CandidateBaselineState =
+  LD2410_CANDIDATE_STATE_INACTIVE;
+
+bool ld2410CandidateInitialized = false;
+
+uint32_t ld2410CandidateEpisodeId = 0;
+uint32_t ld2410CandidateWindowCount = 0;
+uint32_t ld2410CandidateBaselineStateTransitions = 0;
+
+unsigned long ld2410CandidateStartedAt = 0;
+unsigned long ld2410CandidateHeldAt = 0;
+unsigned long ld2410CandidateBaselineStateSince = 0;
+unsigned long ld2410CandidateLastSerialAt = 0;
+
+Ld2410AdaptiveMetric ld2410CandidateMovingPct;
+Ld2410AdaptiveMetric ld2410CandidateStationaryPct;
+Ld2410AdaptiveMetric ld2410CandidateTarget2Pct;
+Ld2410AdaptiveMetric ld2410CandidateTarget3Pct;
+Ld2410AdaptiveMetric ld2410CandidateFlips;
+Ld2410AdaptiveMetric ld2410CandidateMovingDistance;
+Ld2410AdaptiveMetric ld2410CandidateMovingIqr;
+Ld2410AdaptiveMetric ld2410CandidateStationaryDistance;
+Ld2410AdaptiveMetric ld2410CandidateStationaryIqr;
+Ld2410AdaptiveMetric ld2410CandidateDetectionDistance;
+Ld2410AdaptiveMetric ld2410CandidateMovingEnergy;
+Ld2410AdaptiveMetric ld2410CandidateStationaryEnergy;
+
+
+
+Ld2410AdaptiveMetric ld2410BaselineMovingPct;
+Ld2410AdaptiveMetric ld2410BaselineStationaryPct;
+Ld2410AdaptiveMetric ld2410BaselineTarget2Pct;
+Ld2410AdaptiveMetric ld2410BaselineTarget3Pct;
+Ld2410AdaptiveMetric ld2410BaselineFlips;
+
+Ld2410AdaptiveMetric ld2410BaselineMovingDistance;
+Ld2410AdaptiveMetric ld2410BaselineMovingIqr;
+Ld2410AdaptiveMetric ld2410BaselineStationaryDistance;
+Ld2410AdaptiveMetric ld2410BaselineStationaryIqr;
+Ld2410AdaptiveMetric ld2410BaselineDetectionDistance;
+
+Ld2410AdaptiveMetric ld2410BaselineMovingEnergy;
+Ld2410AdaptiveMetric ld2410BaselineStationaryEnergy;
+
+static void initializeAdaptiveMetric(
+  float& mean,
+  float& deviation,
+  float value
+) {
+  mean = value;
+  deviation = 0.0f;
+}
+
+static void updateAdaptiveMetric(
+  float& mean,
+  float& deviation,
+  float value,
+  float alpha
+) {
+  float residual = value - mean;
+
+  mean +=
+    alpha * residual;
+
+  float absoluteResidual =
+    residual < 0.0f ? -residual : residual;
+
+  deviation +=
+    alpha *
+    (absoluteResidual - deviation);
+}
+
+static float ld2410AbsoluteFloat(float value) {
+  return value < 0.0f ? -value : value;
+}
+
+static float ld2410MaximumFloat(float a, float b) {
+  return a > b ? a : b;
+}
+
+static float ld2410NormalizedBaselineDifference(
+  float value,
+  float mean,
+  float deviation,
+  float deviationFloor
+) {
+  float denominator =
+    ld2410MaximumFloat(deviation, deviationFloor);
+
+  if (denominator <= 0.0f) {
+    return 0.0f;
+  }
+
+  return
+    ld2410AbsoluteFloat(value - mean) /
+    denominator;
+}
+
+
+// ============================================================
+// v2.3.5 DEVELOPMENT-ONLY TEMPORAL DEVIATION OBSERVER
+//
+// This layer adds temporal persistence to the normalized
+// deviations already calculated by protected adaptive learning.
+//
+// IMPORTANT:
+//   - Observational only.
+//   - RAM only; reboot resets state.
+//   - No MQTT publication.
+//   - No permanent event generation.
+//   - No fall classification.
+//   - No emergency/care interpretation.
+//   - GPIO21 occupancy remains authoritative.
+//   - These states describe sensor-pattern deviation only.
+// ============================================================
+
+static constexpr uint8_t
+  LD2410_DEVIATION_STATE_BASELINE = 0;
+
+static constexpr uint8_t
+  LD2410_DEVIATION_STATE_DEVIATING = 1;
+
+static constexpr uint8_t
+  LD2410_DEVIATION_STATE_SUSTAINED = 2;
+
+// Five accumulated deviation windows are required before the
+// observer calls the pattern sustained.
+//
+// This is a DEVELOPMENT temporal-persistence setting.
+// It is NOT a fall, emergency, or care-risk threshold.
+static constexpr uint8_t
+  LD2410_DEVIATION_SUSTAINED_EVIDENCE_WINDOWS = 5;
+
+// Five consecutive non-deviating windows are required to clear a
+// sustained state. This prevents one ordinary window from instantly
+// erasing persistent deviation evidence.
+static constexpr uint8_t
+  LD2410_DEVIATION_RECOVERY_WINDOWS = 5;
+
+static constexpr uint8_t
+  LD2410_DEVIATION_MAX_EVIDENCE_WINDOWS = 30;
+
+static constexpr unsigned long
+  LD2410_DEVIATION_SERIAL_INTERVAL_MS = 1000UL;
+
+uint8_t ld2410DeviationState =
+  LD2410_DEVIATION_STATE_BASELINE;
+
+uint8_t ld2410DeviationEvidenceWindows = 0;
+uint8_t ld2410DeviationRecoveryWindows = 0;
+
+uint32_t ld2410DeviationStateTransitions = 0;
+
+unsigned long ld2410DeviationStateSince = 0;
+unsigned long ld2410DeviationLastSerialAt = 0;
+
+float ld2410DeviationLastScore = 0.0f;
+uint8_t ld2410DeviationLastDimensions = 0;
+bool ld2410DeviationLastWindowActive = false;
+
+
+// ============================================================
+// v2.3.6 DEVELOPMENT-ONLY DEVIATION EPISODE MEMORY
+//
+// Adds lifecycle memory around the validated v2.3.5 temporal
+// deviation state machine.
+//
+// IMPORTANT:
+//   - Observational only.
+//   - RAM only; reboot resets episode memory.
+//   - Does NOT change deviation scoring.
+//   - Does NOT change temporal-state thresholds.
+//   - Does NOT change adaptive-learning rates.
+//   - No MQTT publication.
+//   - No permanent event generation.
+//   - No fall/emergency/care classification.
+// ============================================================
+
+static constexpr unsigned long
+  LD2410_EPISODE_SERIAL_INTERVAL_MS = 1000UL;
+
+bool ld2410EpisodeActive = false;
+uint32_t ld2410EpisodeId = 0;
+
+unsigned long ld2410EpisodeStartedAt = 0;
+unsigned long ld2410EpisodeSustainedAt = 0;
+unsigned long ld2410EpisodeRecoveryStartedAt = 0;
+unsigned long ld2410EpisodeLastSerialAt = 0;
+
+uint32_t ld2410EpisodeTotalWindows = 0;
+uint32_t ld2410EpisodeDeviatingWindows = 0;
+uint32_t ld2410EpisodeOrdinaryWindows = 0;
+
+float ld2410EpisodePeakScore = 0.0f;
+uint8_t ld2410EpisodePeakDimensions = 0;
+
+
+bool ld2410EpisodeReachedSustained = false;
+
+// ============================================================
+// v2.3.7 DEVELOPMENT-ONLY ADAPTATION ELIGIBILITY OBSERVER
+//
+// OBSERVATIONAL ONLY.
+//
+// This layer does NOT change baseline learning behavior.
+// It describes whether the current feature window would be
+// considered:
+//   - normal_learning
+//   - protected_episode
+//   - persistent_candidate
+//
+// IMPORTANT:
+//   - No MQTT publication.
+//   - No permanent event generation.
+//   - No care/fall/emergency interpretation.
+//   - No baseline alpha changes.
+//   - GPIO21 occupancy remains authoritative.
+// ============================================================
+
+static constexpr uint8_t
+  LD2410_ELIGIBILITY_NORMAL_LEARNING = 0;
+
+static constexpr uint8_t
+  LD2410_ELIGIBILITY_PROTECTED_EPISODE = 1;
+
+static constexpr uint8_t
+  LD2410_ELIGIBILITY_PERSISTENT_CANDIDATE = 2;
+
+// DEVELOPMENT-ONLY persistence marker.
+//
+// An episode must first reach the existing validated sustained
+// deviation state. It must then remain sustained for another
+// five seconds before being observationally labeled a possible
+// persistent candidate.
+//
+// This is NOT a production learning policy or care threshold.
+static constexpr unsigned long
+  LD2410_ELIGIBILITY_PERSISTENT_AFTER_MS = 5000UL;
+
+static constexpr unsigned long
+  LD2410_ELIGIBILITY_SERIAL_INTERVAL_MS = 1000UL;
+
+uint8_t ld2410EligibilityState =
+  LD2410_ELIGIBILITY_NORMAL_LEARNING;
+
+uint32_t ld2410EligibilityStateTransitions = 0;
+
+unsigned long ld2410EligibilityStateSince = 0;
+unsigned long ld2410EligibilityLastSerialAt = 0;
+
+
+
+
+static const char* ld2410EligibilityStateName(
+  uint8_t state
+) {
+  if (
+    state ==
+    LD2410_ELIGIBILITY_PERSISTENT_CANDIDATE
+  ) {
+    return "persistent_candidate";
+  }
+
+  if (
+    state ==
+    LD2410_ELIGIBILITY_PROTECTED_EPISODE
+  ) {
+    return "protected_episode";
+  }
+
+  return "normal_learning";
+}
+
+static void setLd2410EligibilityState(
+  uint8_t newState
+) {
+  if (newState == ld2410EligibilityState) {
+    return;
+  }
+
+  ld2410EligibilityState = newState;
+  ld2410EligibilityStateSince = millis();
+  ++ld2410EligibilityStateTransitions;
+}
+
+static void updateLd2410AdaptationEligibility() {
+  uint8_t desiredState =
+    LD2410_ELIGIBILITY_NORMAL_LEARNING;
+
+  unsigned long sustainedAgeMs = 0;
+  unsigned long episodeAgeMs = 0;
+
+  if (ld2410EpisodeActive) {
+    desiredState =
+      LD2410_ELIGIBILITY_PROTECTED_EPISODE;
+
+    episodeAgeMs =
+      millis() - ld2410EpisodeStartedAt;
+
+    if (
+      ld2410EpisodeReachedSustained &&
+      ld2410EpisodeSustainedAt != 0
+    ) {
+      sustainedAgeMs =
+        millis() - ld2410EpisodeSustainedAt;
+
+      if (
+        sustainedAgeMs >=
+        LD2410_ELIGIBILITY_PERSISTENT_AFTER_MS
+      ) {
+        desiredState =
+          LD2410_ELIGIBILITY_PERSISTENT_CANDIDATE;
+      }
+    }
+  }
+
+  setLd2410EligibilityState(desiredState);
+
+  if (
+    millis() - ld2410EligibilityLastSerialAt <
+    LD2410_ELIGIBILITY_SERIAL_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  ld2410EligibilityLastSerialAt = millis();
+
+  unsigned long stateAgeMs = 0;
+
+  if (ld2410EligibilityStateSince != 0) {
+    stateAgeMs =
+      millis() - ld2410EligibilityStateSince;
+  }
+
+  Serial.printf(
+    "[MMWAVE ELIGIBILITY] "
+    "state=%s "
+    "episodeActive=%u "
+    "episodeId=%lu "
+    "sustained=%u "
+    "sustainedAgeMs=%lu "
+    "episodeAgeMs=%lu "
+    "stateAgeMs=%lu "
+    "transitions=%lu "
+    "observerOnly=1\n",
+    ld2410EligibilityStateName(
+      ld2410EligibilityState
+    ),
+    ld2410EpisodeActive ? 1U : 0U,
+    (unsigned long)ld2410EpisodeId,
+    ld2410EpisodeReachedSustained ? 1U : 0U,
+    (unsigned long)sustainedAgeMs,
+    (unsigned long)episodeAgeMs,
+    (unsigned long)stateAgeMs,
+    (unsigned long)
+      ld2410EligibilityStateTransitions
+  );
+}
+
+static void startLd2410DeviationEpisode() {
+  ld2410EpisodeActive = true;
+  ++ld2410EpisodeId;
+
+  ld2410EpisodeStartedAt = millis();
+  ld2410EpisodeSustainedAt = 0;
+  ld2410EpisodeRecoveryStartedAt = 0;
+  ld2410EpisodeLastSerialAt = 0;
+
+  ld2410EpisodeTotalWindows = 0;
+  ld2410EpisodeDeviatingWindows = 0;
+  ld2410EpisodeOrdinaryWindows = 0;
+
+  ld2410EpisodePeakScore = 0.0f;
+  ld2410EpisodePeakDimensions = 0;
+
+  ld2410EpisodeReachedSustained = false;
+}
+
+
+static void observeLd2410DeviationEpisodeWindow(
+  bool deviationWindow,
+  float maximumOutlierScore,
+  uint8_t outlierDimensions
+) {
+  if (!ld2410EpisodeActive) {
+    if (!deviationWindow) {
+      return;
+    }
+
+    startLd2410DeviationEpisode();
+  }
+
+  ++ld2410EpisodeTotalWindows;
+
+  if (deviationWindow) {
+    ++ld2410EpisodeDeviatingWindows;
+
+    // Recovery must be consecutive. A renewed deviating window
+    // cancels the current recovery interval.
+    ld2410EpisodeRecoveryStartedAt = 0;
+  } else {
+    ++ld2410EpisodeOrdinaryWindows;
+  }
+
+  if (
+    maximumOutlierScore >
+    ld2410EpisodePeakScore
+  ) {
+    ld2410EpisodePeakScore =
+      maximumOutlierScore;
+  }
+
+  if (
+    outlierDimensions >
+    ld2410EpisodePeakDimensions
+  ) {
+    ld2410EpisodePeakDimensions =
+      outlierDimensions;
+  }
+}
+
+
+static void finishLd2410DeviationEpisode() {
+  if (!ld2410EpisodeActive) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  unsigned long durationMs =
+    now - ld2410EpisodeStartedAt;
+
+  unsigned long sustainedDurationMs = 0;
+
+  if (
+    ld2410EpisodeReachedSustained &&
+    ld2410EpisodeSustainedAt != 0
+  ) {
+    sustainedDurationMs =
+      now - ld2410EpisodeSustainedAt;
+  }
+
+  unsigned long recoveryDurationMs = 0;
+
+  if (ld2410EpisodeRecoveryStartedAt != 0) {
+    recoveryDurationMs =
+      now - ld2410EpisodeRecoveryStartedAt;
+  }
+
+  Serial.printf(
+    "[MMWAVE EPISODE END] "
+    "id=%lu "
+    "durationMs=%lu "
+    "windows=%lu "
+    "deviatingWindows=%lu "
+    "ordinaryWindows=%lu "
+    "peakScore=%.2f "
+    "peakDims=%u "
+    "sustained=%u "
+    "sustainedDurationMs=%lu "
+    "recoveryDurationMs=%lu\n",
+    (unsigned long)ld2410EpisodeId,
+    (unsigned long)durationMs,
+    (unsigned long)ld2410EpisodeTotalWindows,
+    (unsigned long)ld2410EpisodeDeviatingWindows,
+    (unsigned long)ld2410EpisodeOrdinaryWindows,
+    ld2410EpisodePeakScore,
+    (unsigned int)ld2410EpisodePeakDimensions,
+    ld2410EpisodeReachedSustained ? 1U : 0U,
+    (unsigned long)sustainedDurationMs,
+    (unsigned long)recoveryDurationMs
+  );
+
+  ld2410EpisodeActive = false;
+  ld2410EpisodeStartedAt = 0;
+  ld2410EpisodeSustainedAt = 0;
+  ld2410EpisodeRecoveryStartedAt = 0;
+  ld2410EpisodeLastSerialAt = 0;
+}
+
+
+static void updateLd2410DeviationEpisodeState(
+  uint8_t previousState,
+  uint8_t currentState,
+  bool deviationWindow
+) {
+  if (!ld2410EpisodeActive) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (
+    currentState ==
+      LD2410_DEVIATION_STATE_SUSTAINED &&
+    !ld2410EpisodeReachedSustained
+  ) {
+    ld2410EpisodeReachedSustained = true;
+    ld2410EpisodeSustainedAt = now;
+  }
+
+  if (
+    currentState ==
+      LD2410_DEVIATION_STATE_SUSTAINED &&
+    !deviationWindow
+  ) {
+    if (ld2410EpisodeRecoveryStartedAt == 0) {
+      ld2410EpisodeRecoveryStartedAt = now;
+    }
+  } else if (deviationWindow) {
+    ld2410EpisodeRecoveryStartedAt = 0;
+  }
+
+  // The validated temporal state machine owns episode closure.
+  // We merely observe when it transitions back to baseline.
+  if (
+    previousState !=
+      LD2410_DEVIATION_STATE_BASELINE &&
+    currentState ==
+      LD2410_DEVIATION_STATE_BASELINE
+  ) {
+    finishLd2410DeviationEpisode();
+    return;
+  }
+
+  if (
+    now - ld2410EpisodeLastSerialAt <
+    LD2410_EPISODE_SERIAL_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  ld2410EpisodeLastSerialAt = now;
+
+  unsigned long episodeAgeMs =
+    now - ld2410EpisodeStartedAt;
+
+  unsigned long sustainedAgeMs = 0;
+
+  if (
+    ld2410EpisodeReachedSustained &&
+    ld2410EpisodeSustainedAt != 0
+  ) {
+    sustainedAgeMs =
+      now - ld2410EpisodeSustainedAt;
+  }
+
+  unsigned long recoveryAgeMs = 0;
+
+  if (ld2410EpisodeRecoveryStartedAt != 0) {
+    recoveryAgeMs =
+      now - ld2410EpisodeRecoveryStartedAt;
+  }
+
+  Serial.printf(
+    "[MMWAVE EPISODE] "
+    "active=1 "
+    "id=%lu "
+    "ageMs=%lu "
+    "windows=%lu "
+    "deviatingWindows=%lu "
+    "ordinaryWindows=%lu "
+    "peakScore=%.2f "
+    "peakDims=%u "
+    "sustained=%u "
+    "sustainedAgeMs=%lu "
+    "recoveryAgeMs=%lu\n",
+    (unsigned long)ld2410EpisodeId,
+    (unsigned long)episodeAgeMs,
+    (unsigned long)ld2410EpisodeTotalWindows,
+    (unsigned long)ld2410EpisodeDeviatingWindows,
+    (unsigned long)ld2410EpisodeOrdinaryWindows,
+    ld2410EpisodePeakScore,
+    (unsigned int)ld2410EpisodePeakDimensions,
+    ld2410EpisodeReachedSustained ? 1U : 0U,
+    (unsigned long)sustainedAgeMs,
+    (unsigned long)recoveryAgeMs
+  );
+}
+
+
+static const char* ld2410DeviationStateName(
+  uint8_t state
+) {
+  if (
+    state ==
+    LD2410_DEVIATION_STATE_SUSTAINED
+  ) {
+    return "sustained_deviation";
+  }
+
+  if (
+    state ==
+    LD2410_DEVIATION_STATE_DEVIATING
+  ) {
+    return "deviating";
+  }
+
+  return "baseline";
+}
+
+static void setLd2410DeviationState(
+  uint8_t newState
+) {
+  if (newState == ld2410DeviationState) {
+    return;
+  }
+
+  ld2410DeviationState = newState;
+  ld2410DeviationStateSince = millis();
+  ++ld2410DeviationStateTransitions;
+}
+
+static void updateLd2410TemporalDeviation(
+  float maximumOutlierScore,
+  uint8_t outlierDimensions,
+  bool downweightWindow
+) {
+  // Reuse the protected-learning normalized evidence rather than
+  // inventing a second independent feature-scoring system.
+  //
+  // One dimension beyond the existing normalized outlier threshold
+  // is enough to mark a window as observationally deviating.
+  //
+  // A protected/downweighted window is always deviating.
+  bool deviationWindow =
+    downweightWindow ||
+    outlierDimensions >= 1 ||
+    maximumOutlierScore >=
+      LD2410_BASELINE_OUTLIER_SCORE;
+
+  ld2410DeviationLastScore =
+    maximumOutlierScore;
+
+  ld2410DeviationLastDimensions =
+    outlierDimensions;
+
+  ld2410DeviationLastWindowActive =
+    deviationWindow;
+
+  // v2.3.6 episode memory observes the exact same window used by
+  // the validated v2.3.5 temporal state machine.
+  uint8_t previousDeviationState =
+    ld2410DeviationState;
+
+  observeLd2410DeviationEpisodeWindow(
+    deviationWindow,
+    maximumOutlierScore,
+    outlierDimensions
+  );
+
+  if (deviationWindow) {
+    if (
+      ld2410DeviationEvidenceWindows <
+      LD2410_DEVIATION_MAX_EVIDENCE_WINDOWS
+    ) {
+      ++ld2410DeviationEvidenceWindows;
+    }
+
+    ld2410DeviationRecoveryWindows = 0;
+  } else {
+    // Evidence decays gradually rather than disappearing after a
+    // single ordinary rolling window.
+    if (ld2410DeviationEvidenceWindows > 0) {
+      --ld2410DeviationEvidenceWindows;
+    }
+
+    if (
+      ld2410DeviationState ==
+      LD2410_DEVIATION_STATE_SUSTAINED
+    ) {
+      if (
+        ld2410DeviationRecoveryWindows <
+        LD2410_DEVIATION_RECOVERY_WINDOWS
+      ) {
+        ++ld2410DeviationRecoveryWindows;
+      }
+    } else {
+      ld2410DeviationRecoveryWindows = 0;
+    }
+  }
+
+  if (
+    ld2410DeviationState ==
+    LD2410_DEVIATION_STATE_BASELINE
+  ) {
+    if (ld2410DeviationEvidenceWindows > 0) {
+      setLd2410DeviationState(
+        LD2410_DEVIATION_STATE_DEVIATING
+      );
+    }
+  } else if (
+    ld2410DeviationState ==
+    LD2410_DEVIATION_STATE_DEVIATING
+  ) {
+    if (
+      ld2410DeviationEvidenceWindows >=
+      LD2410_DEVIATION_SUSTAINED_EVIDENCE_WINDOWS
+    ) {
+      setLd2410DeviationState(
+        LD2410_DEVIATION_STATE_SUSTAINED
+      );
+    } else if (
+      ld2410DeviationEvidenceWindows == 0
+    ) {
+      setLd2410DeviationState(
+        LD2410_DEVIATION_STATE_BASELINE
+      );
+    }
+  } else if (
+    ld2410DeviationState ==
+    LD2410_DEVIATION_STATE_SUSTAINED
+  ) {
+    if (
+      ld2410DeviationRecoveryWindows >=
+      LD2410_DEVIATION_RECOVERY_WINDOWS
+    ) {
+      ld2410DeviationEvidenceWindows = 0;
+      ld2410DeviationRecoveryWindows = 0;
+
+      setLd2410DeviationState(
+        LD2410_DEVIATION_STATE_BASELINE
+      );
+    }
+  }
+
+  // Observe the state produced by the existing temporal state
+  // machine. Episode memory does not influence that state.
+  updateLd2410DeviationEpisodeState(
+    previousDeviationState,
+    ld2410DeviationState,
+    deviationWindow
+  );
+
+  // v2.3.7 observational adaptation-eligibility layer.
+  //
+  // This observes the completed temporal/episode update for the
+  // current window. It does NOT alter baseline learning.
+  updateLd2410AdaptationEligibility();
+
+  if (
+    millis() - ld2410DeviationLastSerialAt <
+    LD2410_DEVIATION_SERIAL_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  ld2410DeviationLastSerialAt = millis();
+
+  unsigned long stateAgeMs = 0;
+
+  if (ld2410DeviationStateSince != 0) {
+    stateAgeMs =
+      millis() - ld2410DeviationStateSince;
+  }
+
+  Serial.printf(
+    "[MMWAVE DEVIATION] "
+    "state=%s "
+    "evidence=%u "
+    "recovery=%u "
+    "window=%s "
+    "maxScore=%.2f "
+    "dims=%u "
+    "guard=%s "
+    "stateAgeMs=%lu "
+    "transitions=%lu\n",
+    ld2410DeviationStateName(
+      ld2410DeviationState
+    ),
+    (unsigned int)
+      ld2410DeviationEvidenceWindows,
+    (unsigned int)
+      ld2410DeviationRecoveryWindows,
+    deviationWindow
+      ? "deviating"
+      : "normal",
+    maximumOutlierScore,
+    (unsigned int)outlierDimensions,
+    downweightWindow
+      ? "downweighted"
+      : "normal",
+    (unsigned long)stateAgeMs,
+    (unsigned long)
+      ld2410DeviationStateTransitions
+  );
+}
+
+
+static const char* ld2410CandidateBaselineStateName(
+  uint8_t state
+) {
+  switch (state) {
+    case LD2410_CANDIDATE_STATE_LEARNING:
+      return "learning";
+
+    case LD2410_CANDIDATE_STATE_HELD:
+      return "held";
+
+    default:
+      return "inactive";
+  }
+}
+
+static void setLd2410CandidateState(
+  uint8_t newState
+) {
+  if (ld2410CandidateBaselineState == newState) {
+    return;
+  }
+
+  ld2410CandidateBaselineState = newState;
+  ld2410CandidateBaselineStateSince = millis();
+
+  ++ld2410CandidateBaselineStateTransitions;
+}
+
+static void initializeLd2410CandidateBaseline(
+  uint8_t movingPct,
+  uint8_t stationaryPct,
+  uint8_t target2Pct,
+  uint8_t target3Pct,
+  uint8_t transitionCount,
+  uint16_t movingMedian,
+  uint16_t movingIqr,
+  uint16_t stationaryMedian,
+  uint16_t stationaryIqr,
+  uint16_t detectionMedian,
+  uint8_t movingEnergyMedian,
+  uint8_t stationaryEnergyMedian
+) {
+  initializeAdaptiveMetric(
+    ld2410CandidateMovingPct.mean,
+    ld2410CandidateMovingPct.deviation,
+    movingPct
+  );
+
+  initializeAdaptiveMetric(
+    ld2410CandidateStationaryPct.mean,
+    ld2410CandidateStationaryPct.deviation,
+    stationaryPct
+  );
+
+  initializeAdaptiveMetric(
+    ld2410CandidateTarget2Pct.mean,
+    ld2410CandidateTarget2Pct.deviation,
+    target2Pct
+  );
+
+  initializeAdaptiveMetric(
+    ld2410CandidateTarget3Pct.mean,
+    ld2410CandidateTarget3Pct.deviation,
+    target3Pct
+  );
+
+  initializeAdaptiveMetric(
+    ld2410CandidateFlips.mean,
+    ld2410CandidateFlips.deviation,
+    transitionCount
+  );
+
+  initializeAdaptiveMetric(
+    ld2410CandidateMovingDistance.mean,
+    ld2410CandidateMovingDistance.deviation,
+    movingMedian
+  );
+
+  initializeAdaptiveMetric(
+    ld2410CandidateMovingIqr.mean,
+    ld2410CandidateMovingIqr.deviation,
+    movingIqr
+  );
+
+  initializeAdaptiveMetric(
+    ld2410CandidateStationaryDistance.mean,
+    ld2410CandidateStationaryDistance.deviation,
+    stationaryMedian
+  );
+
+  initializeAdaptiveMetric(
+    ld2410CandidateStationaryIqr.mean,
+    ld2410CandidateStationaryIqr.deviation,
+    stationaryIqr
+  );
+
+  initializeAdaptiveMetric(
+    ld2410CandidateDetectionDistance.mean,
+    ld2410CandidateDetectionDistance.deviation,
+    detectionMedian
+  );
+
+  initializeAdaptiveMetric(
+    ld2410CandidateMovingEnergy.mean,
+    ld2410CandidateMovingEnergy.deviation,
+    movingEnergyMedian
+  );
+
+  initializeAdaptiveMetric(
+    ld2410CandidateStationaryEnergy.mean,
+    ld2410CandidateStationaryEnergy.deviation,
+    stationaryEnergyMedian
+  );
+
+  ld2410CandidateInitialized = true;
+}
+
+
+// ============================================================
+// v2.3.10 — QUARANTINED CANDIDATE STABILITY OBSERVER
+//
+// Observational only.
+//
+// This layer measures internal consistency of successive
+// candidate-learning windows.
+//
+// It does NOT:
+//   - modify the trusted baseline
+//   - modify the candidate baseline
+//   - affect deviation scoring
+//   - affect eligibility
+//   - promote a candidate
+//   - affect MQTT / alerts / care logic
+//
+// candidateWindowDelta:
+//   0.0 = identical successive feature windows
+//   larger values = more window-to-window variation
+//
+// candidateMeanDelta:
+//   cumulative mean of observed candidateWindowDelta values
+//
+// candidateTrendDelta:
+//   current delta minus cumulative mean
+//   negative = currently more internally consistent than
+//              its historical candidate-learning average
+//
+// No promotion/stability threshold is defined here.
+// ============================================================
+
+uint32_t ld2410CandidateStabilitySamples = 0;
+
+float ld2410CandidateWindowDelta = 0.0f;
+float ld2410CandidateMeanDelta = 0.0f;
+float ld2410CandidateTrendDelta = 0.0f;
+
+bool ld2410CandidateStabilityHasPrevious = false;
+bool ld2410CandidateStabilityWasLearning = false;
+
+// ============================================================
+// v2.3.11 CROSS-EPISODE CANDIDATE RECURRENCE OBSERVER
+//
+// OBSERVER ONLY.
+//
+// The final candidate profile from one completed persistent
+// episode becomes a RAM-only reference for the next episode.
+//
+// The next candidate-learning episode is compared against
+// that reference across the same 12 adaptive dimensions.
+//
+// There is intentionally:
+//   - no recurrence threshold
+//   - no same-pattern classification
+//   - no promotion
+//   - no trusted-baseline modification
+// ============================================================
+
+bool ld2410CandidateRecurrenceReferenceValid = false;
+
+uint32_t ld2410CandidateRecurrenceReferenceEpisodeId = 0;
+uint32_t ld2410CandidateRecurrenceCurrentEpisodeId = 0;
+uint32_t ld2410CandidateRecurrenceSamples = 0;
+
+float ld2410CandidateRecurrenceDelta = 0.0f;
+float ld2410CandidateRecurrenceMeanDelta = 0.0f;
+
+bool ld2410CandidateRecurrenceWasLearning = false;
+
+// ============================================================
+// v2.3.12 CANDIDATE-vs-TRUSTED SEPARATION OBSERVER
+//
+// OBSERVER ONLY.
+//
+// Measures normalized distance between:
+//
+//   quarantined candidate profile
+//              and
+//   trusted adaptive baseline
+//
+// while the candidate is actively learning.
+//
+// During persistent_candidate the trusted baseline remains
+// frozen by the existing v2.3.8 policy, so this observer
+// measures candidate separation without moving the trusted
+// reference.
+//
+// When candidate learning ends, final values are held.
+// No measurement from held state is accumulated because the
+// trusted baseline may resume normal learning during recovery.
+//
+// There is intentionally:
+//   - no separation threshold
+//   - no classification
+//   - no promotion
+//   - no trusted-baseline modification
+//   - no candidate-baseline modification
+// ============================================================
+
+uint32_t ld2410CandidateSeparationSamples = 0;
+
+float ld2410CandidateSeparationDelta = 0.0f;
+float ld2410CandidateSeparationMeanDelta = 0.0f;
+
+bool ld2410CandidateSeparationWasLearning = false;
+
+// ============================================================
+// v2.3.13 CANDIDATE SEPARATION TRAJECTORY OBSERVER
+//
+// OBSERVER ONLY.
+//
+// Consumes the already-computed v2.3.12 candidate-to-trusted
+// separation measurement.
+//
+// During each candidate-learning episode:
+//
+// firstDelta:
+//   first measured candidate-to-trusted separation
+//
+// stepDelta:
+//   current separation minus previous separation
+//
+// meanStepDelta:
+//   running mean of successive separation changes
+//
+// episodeDrift:
+//   current separation minus firstDelta
+//
+// Sign is descriptive only:
+//   positive = separation increased
+//   negative = separation decreased
+//
+// There is intentionally:
+//   - no direction threshold
+//   - no convergence classification
+//   - no divergence classification
+//   - no stability classification
+//   - no promotion
+//   - no baseline modification
+// ============================================================
+
+uint32_t ld2410CandidateTrajectorySamples = 0;
+
+float ld2410CandidateTrajectoryFirstDelta = 0.0f;
+float ld2410CandidateTrajectoryPreviousDelta = 0.0f;
+float ld2410CandidateTrajectoryStepDelta = 0.0f;
+float ld2410CandidateTrajectoryMeanStepDelta = 0.0f;
+float ld2410CandidateTrajectoryEpisodeDrift = 0.0f;
+
+bool ld2410CandidateTrajectoryHasPrevious = false;
+bool ld2410CandidateTrajectoryWasLearning = false;
+
+// ============================================================
+// v2.3.14 COMPLETED CANDIDATE EPISODE EVIDENCE SNAPSHOT
+//
+// RAM ONLY.
+// OBSERVER ONLY.
+//
+// When a candidate episode transitions from LEARNING to HELD,
+// copy the final already-computed observational evidence into
+// one completed-episode record.
+//
+// This snapshot does not calculate eligibility.
+// It does not classify the episode.
+// It does not modify either baseline.
+// It does not promote a candidate.
+// It does not generate MQTT or care behavior.
+// ============================================================
+
+bool ld2410CandidateEvidenceValid = false;
+bool ld2410CandidateEvidenceWasLearning = false;
+
+uint32_t ld2410CandidateEvidenceEpisodeId = 0;
+
+uint32_t ld2410CandidateEvidenceStabilitySamples = 0;
+float ld2410CandidateEvidenceStabilityDelta = 0.0f;
+float ld2410CandidateEvidenceStabilityMeanDelta = 0.0f;
+
+uint32_t ld2410CandidateEvidenceRecurrenceSamples = 0;
+float ld2410CandidateEvidenceRecurrenceDelta = 0.0f;
+float ld2410CandidateEvidenceRecurrenceMeanDelta = 0.0f;
+
+uint32_t ld2410CandidateEvidenceSeparationSamples = 0;
+float ld2410CandidateEvidenceSeparationDelta = 0.0f;
+float ld2410CandidateEvidenceSeparationMeanDelta = 0.0f;
+
+uint32_t ld2410CandidateEvidenceTrajectorySamples = 0;
+float ld2410CandidateEvidenceTrajectoryFirstDelta = 0.0f;
+float ld2410CandidateEvidenceTrajectoryStepDelta = 0.0f;
+float ld2410CandidateEvidenceTrajectoryMeanStepDelta = 0.0f;
+float ld2410CandidateEvidenceTrajectoryDrift = 0.0f;
+
+
+
+
+float ld2410CandidateRecurrenceReference[12] = {
+  0.0f, 0.0f, 0.0f, 0.0f,
+  0.0f, 0.0f, 0.0f, 0.0f,
+  0.0f, 0.0f, 0.0f, 0.0f
+};
+
+
+float ld2410CandidatePreviousMovingPct = 0.0f;
+float ld2410CandidatePreviousStationaryPct = 0.0f;
+float ld2410CandidatePreviousTarget2Pct = 0.0f;
+float ld2410CandidatePreviousTarget3Pct = 0.0f;
+float ld2410CandidatePreviousTransitions = 0.0f;
+float ld2410CandidatePreviousMovingMedian = 0.0f;
+float ld2410CandidatePreviousMovingIqr = 0.0f;
+float ld2410CandidatePreviousStationaryMedian = 0.0f;
+float ld2410CandidatePreviousStationaryIqr = 0.0f;
+float ld2410CandidatePreviousDetectionMedian = 0.0f;
+float ld2410CandidatePreviousMovingEnergy = 0.0f;
+float ld2410CandidatePreviousStationaryEnergy = 0.0f;
+
+static float ld2410CandidateRelativeDelta(
+  float a,
+  float b
+)
+{
+  float difference =
+    (a >= b)
+      ? (a - b)
+      : (b - a);
+
+  return difference /
+    (
+      ((a >= 0.0f) ? a : -a) +
+      ((b >= 0.0f) ? b : -b) +
+      1.0f
+    );
+}
+
+
+static void observeLd2410CandidateStability(
+  uint8_t movingPct,
+  uint8_t stationaryPct,
+  uint8_t target2Pct,
+  uint8_t target3Pct,
+  uint8_t transitionCount,
+  uint16_t movingMedian,
+  uint16_t movingIqr,
+  uint16_t stationaryMedian,
+  uint16_t stationaryIqr,
+  uint16_t detectionMedian,
+  uint8_t movingEnergyMedian,
+  uint8_t stationaryEnergyMedian
+)
+{
+  bool learning =
+    ld2410CandidateBaselineState ==
+    LD2410_CANDIDATE_STATE_LEARNING;
+
+  if (!learning) {
+    ld2410CandidateStabilityWasLearning = false;
+    return;
+  }
+
+  // A new learning episode begins with a fresh stability
+  // history. Candidate metric state itself is untouched.
+  if (!ld2410CandidateStabilityWasLearning) {
+    ld2410CandidateStabilitySamples = 0;
+
+    ld2410CandidateWindowDelta = 0.0f;
+    ld2410CandidateMeanDelta = 0.0f;
+    ld2410CandidateTrendDelta = 0.0f;
+
+    ld2410CandidateStabilityHasPrevious = false;
+
+    ld2410CandidateStabilityWasLearning = true;
+  }
+
+  float currentMovingPct = (float)movingPct;
+  float currentStationaryPct = (float)stationaryPct;
+  float currentTarget2Pct = (float)target2Pct;
+  float currentTarget3Pct = (float)target3Pct;
+  float currentTransitions = (float)transitionCount;
+
+  float currentMovingMedian = (float)movingMedian;
+  float currentMovingIqr = (float)movingIqr;
+
+  float currentStationaryMedian =
+    (float)stationaryMedian;
+
+  float currentStationaryIqr =
+    (float)stationaryIqr;
+
+  float currentDetectionMedian =
+    (float)detectionMedian;
+
+  float currentMovingEnergy =
+    (float)movingEnergyMedian;
+
+  float currentStationaryEnergy =
+    (float)stationaryEnergyMedian;
+
+  if (ld2410CandidateStabilityHasPrevious) {
+    float totalDelta = 0.0f;
+
+    totalDelta += ld2410CandidateRelativeDelta(
+      currentMovingPct,
+      ld2410CandidatePreviousMovingPct
+    );
+
+    totalDelta += ld2410CandidateRelativeDelta(
+      currentStationaryPct,
+      ld2410CandidatePreviousStationaryPct
+    );
+
+    totalDelta += ld2410CandidateRelativeDelta(
+      currentTarget2Pct,
+      ld2410CandidatePreviousTarget2Pct
+    );
+
+    totalDelta += ld2410CandidateRelativeDelta(
+      currentTarget3Pct,
+      ld2410CandidatePreviousTarget3Pct
+    );
+
+    totalDelta += ld2410CandidateRelativeDelta(
+      currentTransitions,
+      ld2410CandidatePreviousTransitions
+    );
+
+    totalDelta += ld2410CandidateRelativeDelta(
+      currentMovingMedian,
+      ld2410CandidatePreviousMovingMedian
+    );
+
+    totalDelta += ld2410CandidateRelativeDelta(
+      currentMovingIqr,
+      ld2410CandidatePreviousMovingIqr
+    );
+
+    totalDelta += ld2410CandidateRelativeDelta(
+      currentStationaryMedian,
+      ld2410CandidatePreviousStationaryMedian
+    );
+
+    totalDelta += ld2410CandidateRelativeDelta(
+      currentStationaryIqr,
+      ld2410CandidatePreviousStationaryIqr
+    );
+
+    totalDelta += ld2410CandidateRelativeDelta(
+      currentDetectionMedian,
+      ld2410CandidatePreviousDetectionMedian
+    );
+
+    totalDelta += ld2410CandidateRelativeDelta(
+      currentMovingEnergy,
+      ld2410CandidatePreviousMovingEnergy
+    );
+
+    totalDelta += ld2410CandidateRelativeDelta(
+      currentStationaryEnergy,
+      ld2410CandidatePreviousStationaryEnergy
+    );
+
+    ld2410CandidateWindowDelta =
+      totalDelta / 12.0f;
+
+    ++ld2410CandidateStabilitySamples;
+
+    float n =
+      (float)ld2410CandidateStabilitySamples;
+
+    ld2410CandidateMeanDelta +=
+      (
+        ld2410CandidateWindowDelta -
+        ld2410CandidateMeanDelta
+      ) / n;
+
+    ld2410CandidateTrendDelta =
+      ld2410CandidateWindowDelta -
+      ld2410CandidateMeanDelta;
+  }
+
+  ld2410CandidatePreviousMovingPct =
+    currentMovingPct;
+
+  ld2410CandidatePreviousStationaryPct =
+    currentStationaryPct;
+
+  ld2410CandidatePreviousTarget2Pct =
+    currentTarget2Pct;
+
+  ld2410CandidatePreviousTarget3Pct =
+    currentTarget3Pct;
+
+  ld2410CandidatePreviousTransitions =
+    currentTransitions;
+
+  ld2410CandidatePreviousMovingMedian =
+    currentMovingMedian;
+
+  ld2410CandidatePreviousMovingIqr =
+    currentMovingIqr;
+
+  ld2410CandidatePreviousStationaryMedian =
+    currentStationaryMedian;
+
+  ld2410CandidatePreviousStationaryIqr =
+    currentStationaryIqr;
+
+  ld2410CandidatePreviousDetectionMedian =
+    currentDetectionMedian;
+
+  ld2410CandidatePreviousMovingEnergy =
+    currentMovingEnergy;
+
+  ld2410CandidatePreviousStationaryEnergy =
+    currentStationaryEnergy;
+
+  ld2410CandidateStabilityHasPrevious = true;
+}
+
+// ------------------------------------------------------------
+// Capture the final quarantined candidate profile when a
+// persistent episode completes.
+//
+// This reference is RAM-only and observational.
+// ------------------------------------------------------------
+
+static void captureLd2410CandidateRecurrenceReference()
+{
+  ld2410CandidateRecurrenceReference[0] =
+    ld2410CandidateMovingPct.mean;
+  ld2410CandidateRecurrenceReference[1] =
+    ld2410CandidateStationaryPct.mean;
+  ld2410CandidateRecurrenceReference[2] =
+    ld2410CandidateTarget2Pct.mean;
+  ld2410CandidateRecurrenceReference[3] =
+    ld2410CandidateTarget3Pct.mean;
+  ld2410CandidateRecurrenceReference[4] =
+    ld2410CandidateFlips.mean;
+  ld2410CandidateRecurrenceReference[5] =
+    ld2410CandidateMovingDistance.mean;
+  ld2410CandidateRecurrenceReference[6] =
+    ld2410CandidateMovingIqr.mean;
+  ld2410CandidateRecurrenceReference[7] =
+    ld2410CandidateStationaryDistance.mean;
+  ld2410CandidateRecurrenceReference[8] =
+    ld2410CandidateStationaryIqr.mean;
+  ld2410CandidateRecurrenceReference[9] =
+    ld2410CandidateDetectionDistance.mean;
+  ld2410CandidateRecurrenceReference[10] =
+    ld2410CandidateMovingEnergy.mean;
+  ld2410CandidateRecurrenceReference[11] =
+    ld2410CandidateStationaryEnergy.mean;
+
+  ld2410CandidateRecurrenceReferenceEpisodeId =
+    ld2410CandidateEpisodeId;
+
+  ld2410CandidateRecurrenceReferenceValid = true;
+}
+
+
+// ------------------------------------------------------------
+// Compare the current candidate profile to the immediately
+// preceding held candidate profile.
+//
+// No interpretation threshold exists in v2.3.11.
+// ------------------------------------------------------------
+
+static void observeLd2410CandidateRecurrence()
+{
+  const bool learning =
+    (
+      ld2410CandidateBaselineState ==
+      LD2410_CANDIDATE_STATE_LEARNING
+    );
+
+  if (
+    learning &&
+    !ld2410CandidateRecurrenceWasLearning
+  )
+  {
+    ld2410CandidateRecurrenceCurrentEpisodeId =
+      ld2410CandidateEpisodeId;
+
+    ld2410CandidateRecurrenceSamples = 0;
+    ld2410CandidateRecurrenceDelta = 0.0f;
+    ld2410CandidateRecurrenceMeanDelta = 0.0f;
+  }
+
+  if (
+    learning &&
+    ld2410CandidateRecurrenceReferenceValid &&
+    (
+      ld2410CandidateEpisodeId !=
+      ld2410CandidateRecurrenceReferenceEpisodeId
+    )
+  )
+  {
+    float current[12] = {
+      ld2410CandidateMovingPct.mean,
+    ld2410CandidateStationaryPct.mean,
+    ld2410CandidateTarget2Pct.mean,
+    ld2410CandidateTarget3Pct.mean,
+    ld2410CandidateFlips.mean,
+    ld2410CandidateMovingDistance.mean,
+    ld2410CandidateMovingIqr.mean,
+    ld2410CandidateStationaryDistance.mean,
+    ld2410CandidateStationaryIqr.mean,
+    ld2410CandidateDetectionDistance.mean,
+    ld2410CandidateMovingEnergy.mean,
+    ld2410CandidateStationaryEnergy.mean
+    };
+
+    float totalDelta = 0.0f;
+
+    for (uint8_t i = 0; i < 12; ++i)
+    {
+      totalDelta +=
+        ld2410CandidateRelativeDelta(
+          current[i],
+          ld2410CandidateRecurrenceReference[i]
+        );
+    }
+
+    ld2410CandidateRecurrenceDelta =
+      totalDelta / 12.0f;
+
+    ++ld2410CandidateRecurrenceSamples;
+
+    float n =
+      (float)ld2410CandidateRecurrenceSamples;
+
+    ld2410CandidateRecurrenceMeanDelta +=
+      (
+        ld2410CandidateRecurrenceDelta -
+        ld2410CandidateRecurrenceMeanDelta
+      ) / n;
+  }
+
+  ld2410CandidateRecurrenceWasLearning =
+    learning;
+}
+
+// ------------------------------------------------------------
+// v2.3.12 candidate-vs-trusted separation observer.
+//
+// Uses the same normalized relative-distance primitive already
+// validated by candidate stability and recurrence observation.
+//
+// This observer updates ONLY during candidate learning.
+// ------------------------------------------------------------
+
+static void observeLd2410CandidateTrustedSeparation()
+{
+  const bool learning =
+    (
+      ld2410CandidateBaselineState ==
+      LD2410_CANDIDATE_STATE_LEARNING
+    );
+
+  // New candidate-learning episode:
+  // begin a fresh separation trajectory.
+  if (
+    learning &&
+    !ld2410CandidateSeparationWasLearning
+  )
+  {
+    ld2410CandidateSeparationSamples = 0;
+    ld2410CandidateSeparationDelta = 0.0f;
+    ld2410CandidateSeparationMeanDelta = 0.0f;
+  }
+
+  if (learning)
+  {
+    float totalDelta = 0.0f;
+
+    totalDelta +=
+      ld2410CandidateRelativeDelta(
+        ld2410CandidateMovingPct.mean,
+        ld2410BaselineMovingPct.mean
+      );
+
+    totalDelta +=
+      ld2410CandidateRelativeDelta(
+        ld2410CandidateStationaryPct.mean,
+        ld2410BaselineStationaryPct.mean
+      );
+
+    totalDelta +=
+      ld2410CandidateRelativeDelta(
+        ld2410CandidateTarget2Pct.mean,
+        ld2410BaselineTarget2Pct.mean
+      );
+
+    totalDelta +=
+      ld2410CandidateRelativeDelta(
+        ld2410CandidateTarget3Pct.mean,
+        ld2410BaselineTarget3Pct.mean
+      );
+
+    totalDelta +=
+      ld2410CandidateRelativeDelta(
+        ld2410CandidateFlips.mean,
+        ld2410BaselineFlips.mean
+      );
+
+    totalDelta +=
+      ld2410CandidateRelativeDelta(
+        ld2410CandidateMovingDistance.mean,
+        ld2410BaselineMovingDistance.mean
+      );
+
+    totalDelta +=
+      ld2410CandidateRelativeDelta(
+        ld2410CandidateMovingIqr.mean,
+        ld2410BaselineMovingIqr.mean
+      );
+
+    totalDelta +=
+      ld2410CandidateRelativeDelta(
+        ld2410CandidateStationaryDistance.mean,
+        ld2410BaselineStationaryDistance.mean
+      );
+
+    totalDelta +=
+      ld2410CandidateRelativeDelta(
+        ld2410CandidateStationaryIqr.mean,
+        ld2410BaselineStationaryIqr.mean
+      );
+
+    totalDelta +=
+      ld2410CandidateRelativeDelta(
+        ld2410CandidateDetectionDistance.mean,
+        ld2410BaselineDetectionDistance.mean
+      );
+
+    totalDelta +=
+      ld2410CandidateRelativeDelta(
+        ld2410CandidateMovingEnergy.mean,
+        ld2410BaselineMovingEnergy.mean
+      );
+
+    totalDelta +=
+      ld2410CandidateRelativeDelta(
+        ld2410CandidateStationaryEnergy.mean,
+        ld2410BaselineStationaryEnergy.mean
+      );
+
+    ld2410CandidateSeparationDelta =
+      totalDelta / 12.0f;
+
+    ++ld2410CandidateSeparationSamples;
+
+    float n =
+      (float)ld2410CandidateSeparationSamples;
+
+    ld2410CandidateSeparationMeanDelta +=
+      (
+        ld2410CandidateSeparationDelta -
+        ld2410CandidateSeparationMeanDelta
+      ) / n;
+  }
+
+  ld2410CandidateSeparationWasLearning =
+    learning;
+}
+
+// ------------------------------------------------------------
+// v2.3.13 candidate-separation trajectory observer.
+//
+// This function cannot modify either adaptive baseline.
+// It observes only the separation value already produced by
+// the v2.3.12 observer.
+// ------------------------------------------------------------
+
+static void observeLd2410CandidateSeparationTrajectory()
+{
+  const bool learning =
+    (
+      ld2410CandidateBaselineState ==
+      LD2410_CANDIDATE_STATE_LEARNING
+    );
+
+  // A new candidate-learning episode starts a fresh
+  // trajectory history.
+  if (
+    learning &&
+    !ld2410CandidateTrajectoryWasLearning
+  )
+  {
+    ld2410CandidateTrajectorySamples = 0;
+
+    ld2410CandidateTrajectoryFirstDelta = 0.0f;
+    ld2410CandidateTrajectoryPreviousDelta = 0.0f;
+    ld2410CandidateTrajectoryStepDelta = 0.0f;
+    ld2410CandidateTrajectoryMeanStepDelta = 0.0f;
+    ld2410CandidateTrajectoryEpisodeDrift = 0.0f;
+
+    ld2410CandidateTrajectoryHasPrevious = false;
+  }
+
+  // v2.3.12 separation observer has already run for this
+  // analytical window. Consume that measurement only while
+  // the candidate is actively learning.
+  if (
+    learning &&
+    ld2410CandidateSeparationSamples > 0
+  )
+  {
+    const float currentDelta =
+      ld2410CandidateSeparationDelta;
+
+    if (!ld2410CandidateTrajectoryHasPrevious)
+    {
+      ld2410CandidateTrajectoryFirstDelta =
+        currentDelta;
+
+      ld2410CandidateTrajectoryPreviousDelta =
+        currentDelta;
+
+      ld2410CandidateTrajectoryStepDelta = 0.0f;
+      ld2410CandidateTrajectoryMeanStepDelta = 0.0f;
+      ld2410CandidateTrajectoryEpisodeDrift = 0.0f;
+
+      ld2410CandidateTrajectorySamples = 1;
+
+      ld2410CandidateTrajectoryHasPrevious = true;
+    }
+    else
+    {
+      ld2410CandidateTrajectoryStepDelta =
+        currentDelta -
+        ld2410CandidateTrajectoryPreviousDelta;
+
+      ++ld2410CandidateTrajectorySamples;
+
+      // There are samples-1 actual step transitions because
+      // sample #1 establishes the reference measurement.
+      const float transitionCount =
+        (float)(
+          ld2410CandidateTrajectorySamples - 1
+        );
+
+      ld2410CandidateTrajectoryMeanStepDelta +=
+        (
+          ld2410CandidateTrajectoryStepDelta -
+          ld2410CandidateTrajectoryMeanStepDelta
+        ) / transitionCount;
+
+      ld2410CandidateTrajectoryEpisodeDrift =
+        currentDelta -
+        ld2410CandidateTrajectoryFirstDelta;
+
+      ld2410CandidateTrajectoryPreviousDelta =
+        currentDelta;
+    }
+  }
+
+  ld2410CandidateTrajectoryWasLearning =
+    learning;
+}
+
+
+// ------------------------------------------------------------
+// v2.3.15 DEVELOPMENT-ONLY COMPLETED EPISODE EVIDENCE HISTORY.
+//
+// Fixed-size RAM-only ring buffer retaining the eight most
+// recently completed candidate evidence snapshots.
+//
+// Each record is copied only from the already-validated v2.3.14
+// completed-episode snapshot.
+//
+// This history does NOT:
+//   - create a score
+//   - classify similarity
+//   - classify recurrence
+//   - promote a candidate
+//   - change trusted learning
+//   - change candidate learning
+//   - publish MQTT
+//   - persist to flash/NVS
+//
+// Oldest entries are overwritten only after capacity is reached.
+// ------------------------------------------------------------
+
+static constexpr uint8_t
+  LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY = 8;
+
+uint8_t ld2410CandidateEvidenceHistoryCount = 0;
+uint8_t ld2410CandidateEvidenceHistoryWriteIndex = 0;
+
+uint32_t
+  ld2410CandidateEvidenceHistoryEpisodeId[
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ] = {};
+
+uint32_t
+  ld2410CandidateEvidenceHistoryStabilitySamples[
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ] = {};
+
+float
+  ld2410CandidateEvidenceHistoryStabilityDelta[
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ] = {};
+
+float
+  ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ] = {};
+
+uint32_t
+  ld2410CandidateEvidenceHistoryRecurrenceSamples[
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ] = {};
+
+float
+  ld2410CandidateEvidenceHistoryRecurrenceDelta[
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ] = {};
+
+float
+  ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ] = {};
+
+uint32_t
+  ld2410CandidateEvidenceHistorySeparationSamples[
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ] = {};
+
+float
+  ld2410CandidateEvidenceHistorySeparationDelta[
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ] = {};
+
+float
+  ld2410CandidateEvidenceHistorySeparationMeanDelta[
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ] = {};
+
+uint32_t
+  ld2410CandidateEvidenceHistoryTrajectorySamples[
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ] = {};
+
+float
+  ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ] = {};
+
+float
+  ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ] = {};
+
+float
+  ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ] = {};
+
+float
+  ld2410CandidateEvidenceHistoryTrajectoryDrift[
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ] = {};
+
+
+// ============================================================
+// v2.4.2 DEVELOPMENT-ONLY EPISODE FEATURE EVIDENCE
+//
+// Preserve the already-computed final 12-dimensional candidate
+// profile beside each completed observer-history episode.
+//
+// Observer only. No threshold, eligibility, baseline, promotion,
+// classification, alert, or care-policy behavior is changed.
+// ============================================================
+
+static constexpr uint8_t
+  LD2410_EPISODE_PROFILE_DIMENSIONS = 12;
+
+float ld2410CandidateEvidenceHistoryEpisodeProfile[
+  LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+][LD2410_EPISODE_PROFILE_DIMENSIONS] = {};
+
+
+
+// ------------------------------------------------------------
+// v2.3.16 DEVELOPMENT-ONLY COMPLETED EPISODE HISTORY COMPARISON.
+//
+// After a completed episode is appended to the validated
+// RAM-only history, compare that newest record independently
+// with every older retained record.
+//
+// Ten continuous evidence dimensions are compared:
+//
+//   stability delta
+//   stability mean delta
+//   recurrence delta
+//   recurrence mean delta
+//   separation delta
+//   separation mean delta
+//   trajectory first delta
+//   trajectory step delta
+//   trajectory mean-step delta
+//   trajectory drift
+//
+// Sample counts are preserved as metadata but are intentionally
+// excluded from the behavioral distance.
+//
+// Each pair produces only a descriptive mean relative delta.
+//
+// There is:
+//   NO comparison threshold
+//   NO nearest-match decision
+//   NO similarity classification
+//   NO history score
+//   NO candidate promotion
+//   NO baseline-policy change
+//   NO MQTT / alert output
+// ------------------------------------------------------------
+
+static float ld2410CandidateHistoryRelativeDelta(
+  float currentValue,
+  float priorValue
+) {
+  float currentMagnitude =
+    fabsf(currentValue);
+
+  float priorMagnitude =
+    fabsf(priorValue);
+
+  float denominator =
+    currentMagnitude > priorMagnitude
+      ? currentMagnitude
+      : priorMagnitude;
+
+  if (denominator < 0.00001f) {
+    denominator = 0.00001f;
+  }
+
+  return
+    fabsf(currentValue - priorValue) /
+    denominator;
+}
+
+
+static void observeLd2410CandidateEpisodeHistoryComparison()
+{
+  if (ld2410CandidateEvidenceHistoryCount < 2) {
+    return;
+  }
+
+  const uint8_t newestIndex =
+    ld2410CandidateEvidenceHistoryNewestIndex();
+
+  const uint8_t oldestIndex =
+    ld2410CandidateEvidenceHistoryOldestIndex();
+
+  const uint32_t newestEpisode =
+    ld2410CandidateEvidenceHistoryEpisodeId[
+      newestIndex
+    ];
+
+  for (
+    uint8_t logicalOffset = 0;
+    logicalOffset <
+      ld2410CandidateEvidenceHistoryCount - 1;
+    ++logicalOffset
+  ) {
+    const uint8_t priorIndex =
+      (
+        oldestIndex + logicalOffset
+      ) %
+      LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY;
+
+    if (priorIndex == newestIndex) {
+      continue;
+    }
+
+    const float stabilityDeltaDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryStabilityDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryStabilityDelta[
+          priorIndex
+        ]
+      );
+
+    const float stabilityMeanDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+          priorIndex
+        ]
+      );
+
+    const float recurrenceDeltaDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+          priorIndex
+        ]
+      );
+
+    const float recurrenceMeanDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+          priorIndex
+        ]
+      );
+
+    const float separationDeltaDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistorySeparationDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistorySeparationDelta[
+          priorIndex
+        ]
+      );
+
+    const float separationMeanDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryFirstDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryStepDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryMeanStepDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryDriftDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+          priorIndex
+        ]
+      );
+
+    const float meanRelativeDelta =
+      (
+        stabilityDeltaDifference +
+        stabilityMeanDifference +
+        recurrenceDeltaDifference +
+        recurrenceMeanDifference +
+        separationDeltaDifference +
+        separationMeanDifference +
+        trajectoryFirstDifference +
+        trajectoryStepDifference +
+        trajectoryMeanStepDifference +
+        trajectoryDriftDifference
+      ) / 10.0f;
+
+    Serial.printf(
+      "[MMWAVE CANDIDATE HISTORY COMPARISON] "
+      "newestEpisode=%lu "
+      "priorEpisode=%lu "
+      "newestIndex=%u "
+      "priorIndex=%u "
+      "dimensions=10 "
+      "meanRelativeDelta=%.5f "
+      "stabilityDeltaDifference=%.5f "
+      "stabilityMeanDifference=%.5f "
+      "recurrenceDeltaDifference=%.5f "
+      "recurrenceMeanDifference=%.5f "
+      "separationDeltaDifference=%.5f "
+      "separationMeanDifference=%.5f "
+      "trajectoryFirstDifference=%.5f "
+      "trajectoryStepDifference=%.5f "
+      "trajectoryMeanStepDifference=%.5f "
+      "trajectoryDriftDifference=%.5f "
+      "observerOnly=1\n",
+      (unsigned long)newestEpisode,
+      (unsigned long)
+        ld2410CandidateEvidenceHistoryEpisodeId[
+          priorIndex
+        ],
+      (unsigned int)newestIndex,
+      (unsigned int)priorIndex,
+      meanRelativeDelta,
+      stabilityDeltaDifference,
+      stabilityMeanDifference,
+      recurrenceDeltaDifference,
+      recurrenceMeanDifference,
+      separationDeltaDifference,
+      separationMeanDifference,
+      trajectoryFirstDifference,
+      trajectoryStepDifference,
+      trajectoryMeanStepDifference,
+      trajectoryDriftDifference
+    );
+  }
+}
+
+
+
+// v2.3.17:
+// Descriptive completed-episode recurrence summary.
+// Observer only. No threshold, classification, score,
+// nearest-match selection, promotion, or baseline effect.
+static void observeLd2410CandidateEpisodeHistoryRecurrenceSummary()
+{
+  if (ld2410CandidateEvidenceHistoryCount < 2) {
+    return;
+  }
+
+  const uint8_t newestIndex =
+    ld2410CandidateEvidenceHistoryNewestIndex();
+
+  const uint8_t oldestIndex =
+    ld2410CandidateEvidenceHistoryOldestIndex();
+
+  const uint32_t newestEpisode =
+    ld2410CandidateEvidenceHistoryEpisodeId[
+      newestIndex
+    ];
+
+  float sumPairwiseRelativeDelta = 0.0f;
+  float minPairwiseRelativeDelta = 0.0f;
+  float maxPairwiseRelativeDelta = 0.0f;
+  uint8_t priorCount = 0;
+
+  for (
+    uint8_t logicalOffset = 0;
+    logicalOffset <
+      ld2410CandidateEvidenceHistoryCount - 1;
+    ++logicalOffset
+  ) {
+    const uint8_t priorIndex =
+      (
+        oldestIndex + logicalOffset
+      ) %
+      LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY;
+
+    if (priorIndex == newestIndex) {
+      continue;
+    }
+
+    const float pairwiseRelativeDelta =
+      (
+        ld2410CandidateHistoryRelativeDelta(
+          ld2410CandidateEvidenceHistoryStabilityDelta[
+            newestIndex
+          ],
+          ld2410CandidateEvidenceHistoryStabilityDelta[
+            priorIndex
+          ]
+        ) +
+        ld2410CandidateHistoryRelativeDelta(
+          ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+            newestIndex
+          ],
+          ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+            priorIndex
+          ]
+        ) +
+        ld2410CandidateHistoryRelativeDelta(
+          ld2410CandidateEvidenceHistoryRecurrenceDelta[
+            newestIndex
+          ],
+          ld2410CandidateEvidenceHistoryRecurrenceDelta[
+            priorIndex
+          ]
+        ) +
+        ld2410CandidateHistoryRelativeDelta(
+          ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+            newestIndex
+          ],
+          ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+            priorIndex
+          ]
+        ) +
+        ld2410CandidateHistoryRelativeDelta(
+          ld2410CandidateEvidenceHistorySeparationDelta[
+            newestIndex
+          ],
+          ld2410CandidateEvidenceHistorySeparationDelta[
+            priorIndex
+          ]
+        ) +
+        ld2410CandidateHistoryRelativeDelta(
+          ld2410CandidateEvidenceHistorySeparationMeanDelta[
+            newestIndex
+          ],
+          ld2410CandidateEvidenceHistorySeparationMeanDelta[
+            priorIndex
+          ]
+        ) +
+        ld2410CandidateHistoryRelativeDelta(
+          ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+            newestIndex
+          ],
+          ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+            priorIndex
+          ]
+        ) +
+        ld2410CandidateHistoryRelativeDelta(
+          ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+            newestIndex
+          ],
+          ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+            priorIndex
+          ]
+        ) +
+        ld2410CandidateHistoryRelativeDelta(
+          ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+            newestIndex
+          ],
+          ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+            priorIndex
+          ]
+        ) +
+        ld2410CandidateHistoryRelativeDelta(
+          ld2410CandidateEvidenceHistoryTrajectoryDrift[
+            newestIndex
+          ],
+          ld2410CandidateEvidenceHistoryTrajectoryDrift[
+            priorIndex
+          ]
+        )
+      ) / 10.0f;
+
+    if (priorCount == 0) {
+      minPairwiseRelativeDelta =
+        pairwiseRelativeDelta;
+      maxPairwiseRelativeDelta =
+        pairwiseRelativeDelta;
+    } else {
+      if (
+        pairwiseRelativeDelta <
+        minPairwiseRelativeDelta
+      ) {
+        minPairwiseRelativeDelta =
+          pairwiseRelativeDelta;
+      }
+
+      if (
+        pairwiseRelativeDelta >
+        maxPairwiseRelativeDelta
+      ) {
+        maxPairwiseRelativeDelta =
+          pairwiseRelativeDelta;
+      }
+    }
+
+    sumPairwiseRelativeDelta +=
+      pairwiseRelativeDelta;
+
+    ++priorCount;
+  }
+
+  if (priorCount == 0) {
+    return;
+  }
+
+  const float meanPairwiseRelativeDelta =
+    sumPairwiseRelativeDelta /
+    (float)priorCount;
+
+  const float rangePairwiseRelativeDelta =
+    maxPairwiseRelativeDelta -
+    minPairwiseRelativeDelta;
+
+  Serial.printf(
+    "[MMWAVE CANDIDATE HISTORY RECURRENCE SUMMARY] "
+    "newestEpisode=%lu "
+    "newestIndex=%u "
+    "priorCount=%u "
+    "dimensions=10 "
+    "meanPairwiseRelativeDelta=%.5f "
+    "minPairwiseRelativeDelta=%.5f "
+    "maxPairwiseRelativeDelta=%.5f "
+    "rangePairwiseRelativeDelta=%.5f "
+    "observerOnly=1\n",
+    (unsigned long)newestEpisode,
+    (unsigned int)newestIndex,
+    (unsigned int)priorCount,
+    meanPairwiseRelativeDelta,
+    minPairwiseRelativeDelta,
+    maxPairwiseRelativeDelta,
+    rangePairwiseRelativeDelta
+  );
+}
+
+
+// v2.3.18:
+// Descriptively identify the retained prior episode having
+// the smallest ten-dimensional mean relative delta from the
+// newest completed episode.
+//
+// This is OBSERVATION ONLY.
+// It does not define similarity, recurrence, trust, promotion,
+// alerting, or any policy threshold.
+static void observeLd2410CandidateEpisodeHistoryNearestPrior()
+{
+  if (ld2410CandidateEvidenceHistoryCount < 2) {
+    return;
+  }
+
+  const uint8_t newestIndex =
+    ld2410CandidateEvidenceHistoryNewestIndex();
+
+  const uint8_t oldestIndex =
+    ld2410CandidateEvidenceHistoryOldestIndex();
+
+  const uint32_t newestEpisode =
+    ld2410CandidateEvidenceHistoryEpisodeId[
+      newestIndex
+    ];
+
+  bool nearestValid = false;
+
+  uint8_t nearestIndex = 0;
+  uint32_t nearestEpisode = 0;
+  float nearestMeanRelativeDelta = 0.0f;
+
+  for (
+    uint8_t logicalOffset = 0;
+    logicalOffset <
+      ld2410CandidateEvidenceHistoryCount - 1;
+    ++logicalOffset
+  ) {
+    const uint8_t priorIndex =
+      (
+        oldestIndex + logicalOffset
+      ) %
+      LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY;
+
+    if (priorIndex == newestIndex) {
+      continue;
+    }
+
+    const float stabilityDeltaDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryStabilityDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryStabilityDelta[
+          priorIndex
+        ]
+      );
+
+    const float stabilityMeanDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+          priorIndex
+        ]
+      );
+
+    const float recurrenceDeltaDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+          priorIndex
+        ]
+      );
+
+    const float recurrenceMeanDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+          priorIndex
+        ]
+      );
+
+    const float separationDeltaDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistorySeparationDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistorySeparationDelta[
+          priorIndex
+        ]
+      );
+
+    const float separationMeanDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryFirstDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryStepDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryMeanStepDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryDriftDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+          priorIndex
+        ]
+      );
+
+    const float meanRelativeDelta =
+      (
+        stabilityDeltaDifference +
+        stabilityMeanDifference +
+        recurrenceDeltaDifference +
+        recurrenceMeanDifference +
+        separationDeltaDifference +
+        separationMeanDifference +
+        trajectoryFirstDifference +
+        trajectoryStepDifference +
+        trajectoryMeanStepDifference +
+        trajectoryDriftDifference
+      ) / 10.0f;
+
+    if (
+      !nearestValid ||
+      meanRelativeDelta < nearestMeanRelativeDelta
+    ) {
+      nearestValid = true;
+
+      nearestIndex = priorIndex;
+
+      nearestEpisode =
+        ld2410CandidateEvidenceHistoryEpisodeId[
+          priorIndex
+        ];
+
+      nearestMeanRelativeDelta =
+        meanRelativeDelta;
+    }
+  }
+
+  if (!nearestValid) {
+    return;
+  }
+
+  Serial.printf(
+    "[MMWAVE CANDIDATE HISTORY NEAREST PRIOR] "
+    "newestEpisode=%lu "
+    "nearestEpisode=%lu "
+    "newestIndex=%u "
+    "nearestIndex=%u "
+    "priorCount=%u "
+    "dimensions=10 "
+    "nearestMeanRelativeDelta=%.5f "
+    "observerOnly=1\n",
+    (unsigned long)newestEpisode,
+    (unsigned long)nearestEpisode,
+    (unsigned int)newestIndex,
+    (unsigned int)nearestIndex,
+    (unsigned int)
+      (
+        ld2410CandidateEvidenceHistoryCount - 1
+      ),
+    nearestMeanRelativeDelta
+  );
+}
+
+
+
+// v2.3.19:
+// Descriptively measure the separation between the nearest
+// and second-nearest retained prior episodes.
+//
+// This is OBSERVATION ONLY.
+// The separation gap is not a confidence threshold,
+// classification rule, history score, or promotion rule.
+static void observeLd2410CandidateEpisodeHistoryNearestSeparation()
+{
+  if (ld2410CandidateEvidenceHistoryCount < 3) {
+    return;
+  }
+
+  const uint8_t newestIndex =
+    ld2410CandidateEvidenceHistoryNewestIndex();
+
+  const uint8_t oldestIndex =
+    ld2410CandidateEvidenceHistoryOldestIndex();
+
+  const uint32_t newestEpisode =
+    ld2410CandidateEvidenceHistoryEpisodeId[
+      newestIndex
+    ];
+
+  bool nearestValid = false;
+  bool secondNearestValid = false;
+
+  uint8_t nearestIndex = 0;
+  uint8_t secondNearestIndex = 0;
+
+  uint32_t nearestEpisode = 0;
+  uint32_t secondNearestEpisode = 0;
+
+  float nearestMeanRelativeDelta = 0.0f;
+  float secondNearestMeanRelativeDelta = 0.0f;
+
+  for (
+    uint8_t logicalOffset = 0;
+    logicalOffset <
+      ld2410CandidateEvidenceHistoryCount - 1;
+    ++logicalOffset
+  ) {
+    const uint8_t priorIndex =
+      (
+        oldestIndex + logicalOffset
+      ) %
+      LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY;
+
+    if (priorIndex == newestIndex) {
+      continue;
+    }
+
+    const float stabilityDeltaDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryStabilityDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryStabilityDelta[
+          priorIndex
+        ]
+      );
+
+    const float stabilityMeanDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+          priorIndex
+        ]
+      );
+
+    const float recurrenceDeltaDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+          priorIndex
+        ]
+      );
+
+    const float recurrenceMeanDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+          priorIndex
+        ]
+      );
+
+    const float separationDeltaDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistorySeparationDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistorySeparationDelta[
+          priorIndex
+        ]
+      );
+
+    const float separationMeanDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryFirstDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryStepDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryMeanStepDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryDriftDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+          priorIndex
+        ]
+      );
+
+    const float meanRelativeDelta =
+      (
+        stabilityDeltaDifference +
+        stabilityMeanDifference +
+        recurrenceDeltaDifference +
+        recurrenceMeanDifference +
+        separationDeltaDifference +
+        separationMeanDifference +
+        trajectoryFirstDifference +
+        trajectoryStepDifference +
+        trajectoryMeanStepDifference +
+        trajectoryDriftDifference
+      ) / 10.0f;
+
+    const uint32_t priorEpisode =
+      ld2410CandidateEvidenceHistoryEpisodeId[
+        priorIndex
+      ];
+
+    if (
+      !nearestValid ||
+      meanRelativeDelta < nearestMeanRelativeDelta
+    ) {
+      if (nearestValid) {
+        secondNearestValid = true;
+        secondNearestIndex = nearestIndex;
+        secondNearestEpisode = nearestEpisode;
+        secondNearestMeanRelativeDelta =
+          nearestMeanRelativeDelta;
+      }
+
+      nearestValid = true;
+      nearestIndex = priorIndex;
+      nearestEpisode = priorEpisode;
+      nearestMeanRelativeDelta = meanRelativeDelta;
+    }
+    else if (
+      !secondNearestValid ||
+      meanRelativeDelta < secondNearestMeanRelativeDelta
+    ) {
+      secondNearestValid = true;
+      secondNearestIndex = priorIndex;
+      secondNearestEpisode = priorEpisode;
+      secondNearestMeanRelativeDelta =
+        meanRelativeDelta;
+    }
+  }
+
+  if (!nearestValid || !secondNearestValid) {
+    return;
+  }
+
+  const float nearestSeparationGap =
+    secondNearestMeanRelativeDelta -
+    nearestMeanRelativeDelta;
+
+  Serial.printf(
+    "[MMWAVE CANDIDATE HISTORY NEAREST SEPARATION] "
+    "newestEpisode=%lu "
+    "nearestEpisode=%lu "
+    "secondNearestEpisode=%lu "
+    "newestIndex=%u "
+    "nearestIndex=%u "
+    "secondNearestIndex=%u "
+    "priorCount=%u "
+    "dimensions=10 "
+    "nearestMeanRelativeDelta=%.5f "
+    "secondNearestMeanRelativeDelta=%.5f "
+    "nearestSeparationGap=%.5f "
+    "observerOnly=1\n",
+    (unsigned long)newestEpisode,
+    (unsigned long)nearestEpisode,
+    (unsigned long)secondNearestEpisode,
+    (unsigned int)newestIndex,
+    (unsigned int)nearestIndex,
+    (unsigned int)secondNearestIndex,
+    (unsigned int)
+      (
+        ld2410CandidateEvidenceHistoryCount - 1
+      ),
+    nearestMeanRelativeDelta,
+    secondNearestMeanRelativeDelta,
+    nearestSeparationGap
+  );
+}
+
+
+
+// v2.3.20:
+// Descriptively normalize the nearest-vs-second-nearest separation.
+//
+// relativeSeparation =
+//   (secondNearest - nearest) / max(secondNearest, 0.00001)
+//
+// This remains OBSERVATION ONLY.
+// It is not a threshold, confidence score, classification,
+// promotion rule, or baseline policy input.
+static void observeLd2410CandidateEpisodeHistoryRelativeSeparation()
+{
+  if (ld2410CandidateEvidenceHistoryCount < 3) {
+    return;
+  }
+
+  const uint8_t newestIndex =
+    ld2410CandidateEvidenceHistoryNewestIndex();
+
+  const uint8_t oldestIndex =
+    ld2410CandidateEvidenceHistoryOldestIndex();
+
+  const uint32_t newestEpisode =
+    ld2410CandidateEvidenceHistoryEpisodeId[
+      newestIndex
+    ];
+
+  bool nearestValid = false;
+  bool secondNearestValid = false;
+
+  uint32_t nearestEpisode = 0;
+  uint32_t secondNearestEpisode = 0;
+
+  uint8_t nearestIndex = 0;
+  uint8_t secondNearestIndex = 0;
+
+  float nearestMeanRelativeDelta = 0.0f;
+  float secondNearestMeanRelativeDelta = 0.0f;
+
+  for (
+    uint8_t logicalOffset = 0;
+    logicalOffset <
+      ld2410CandidateEvidenceHistoryCount - 1;
+    ++logicalOffset
+  ) {
+    const uint8_t priorIndex =
+      (
+        oldestIndex + logicalOffset
+      ) %
+      LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY;
+
+    if (priorIndex == newestIndex) {
+      continue;
+    }
+
+    const float stabilityDeltaDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryStabilityDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryStabilityDelta[
+          priorIndex
+        ]
+      );
+
+    const float stabilityMeanDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+          priorIndex
+        ]
+      );
+
+    const float recurrenceDeltaDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+          priorIndex
+        ]
+      );
+
+    const float recurrenceMeanDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+          priorIndex
+        ]
+      );
+
+    const float separationDeltaDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistorySeparationDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistorySeparationDelta[
+          priorIndex
+        ]
+      );
+
+    const float separationMeanDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryFirstDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryStepDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryMeanStepDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryDriftDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+          priorIndex
+        ]
+      );
+
+    const float meanRelativeDelta =
+      (
+        stabilityDeltaDifference +
+        stabilityMeanDifference +
+        recurrenceDeltaDifference +
+        recurrenceMeanDifference +
+        separationDeltaDifference +
+        separationMeanDifference +
+        trajectoryFirstDifference +
+        trajectoryStepDifference +
+        trajectoryMeanStepDifference +
+        trajectoryDriftDifference
+      ) / 10.0f;
+
+    const uint32_t priorEpisode =
+      ld2410CandidateEvidenceHistoryEpisodeId[
+        priorIndex
+      ];
+
+    if (
+      !nearestValid ||
+      meanRelativeDelta < nearestMeanRelativeDelta
+    ) {
+      if (nearestValid) {
+        secondNearestValid = true;
+        secondNearestIndex = nearestIndex;
+        secondNearestEpisode = nearestEpisode;
+        secondNearestMeanRelativeDelta =
+          nearestMeanRelativeDelta;
+      }
+
+      nearestValid = true;
+      nearestIndex = priorIndex;
+      nearestEpisode = priorEpisode;
+      nearestMeanRelativeDelta = meanRelativeDelta;
+    }
+    else if (
+      !secondNearestValid ||
+      meanRelativeDelta < secondNearestMeanRelativeDelta
+    ) {
+      secondNearestValid = true;
+      secondNearestIndex = priorIndex;
+      secondNearestEpisode = priorEpisode;
+      secondNearestMeanRelativeDelta =
+        meanRelativeDelta;
+    }
+  }
+
+  if (!nearestValid || !secondNearestValid) {
+    return;
+  }
+
+  const float absoluteSeparation =
+    secondNearestMeanRelativeDelta -
+    nearestMeanRelativeDelta;
+
+  const float relativeSeparation =
+    absoluteSeparation /
+    max(
+      secondNearestMeanRelativeDelta,
+      0.00001f
+    );
+
+  Serial.printf(
+    "[MMWAVE CANDIDATE HISTORY RELATIVE SEPARATION] "
+    "newestEpisode=%lu "
+    "nearestEpisode=%lu "
+    "secondNearestEpisode=%lu "
+    "newestIndex=%u "
+    "nearestIndex=%u "
+    "secondNearestIndex=%u "
+    "priorCount=%u "
+    "dimensions=10 "
+    "nearestMeanRelativeDelta=%.5f "
+    "secondNearestMeanRelativeDelta=%.5f "
+    "absoluteSeparation=%.5f "
+    "relativeSeparation=%.5f "
+    "observerOnly=1\n",
+    (unsigned long)newestEpisode,
+    (unsigned long)nearestEpisode,
+    (unsigned long)secondNearestEpisode,
+    (unsigned int)newestIndex,
+    (unsigned int)nearestIndex,
+    (unsigned int)secondNearestIndex,
+    (unsigned int)(
+      ld2410CandidateEvidenceHistoryCount - 1
+    ),
+    nearestMeanRelativeDelta,
+    secondNearestMeanRelativeDelta,
+    absoluteSeparation,
+    relativeSeparation
+  );
+}
+
+
+
+// v2.3.21:
+// Descriptively compare the nearest retained prior against the
+// mean distance across all retained prior episodes.
+//
+// nearestAdvantage = historyMean - nearest
+//
+// relativeNearestAdvantage =
+//   nearestAdvantage / max(historyMean, 0.00001)
+//
+// OBSERVATION ONLY.
+// No threshold, confidence classification, similarity decision,
+// recurrence classification, score, promotion, or baseline policy.
+static void observeLd2410CandidateEpisodeHistoryMeanAdvantage()
+{
+  if (ld2410CandidateEvidenceHistoryCount < 3) {
+    return;
+  }
+
+  const uint8_t newestIndex =
+    ld2410CandidateEvidenceHistoryNewestIndex();
+
+  const uint8_t oldestIndex =
+    ld2410CandidateEvidenceHistoryOldestIndex();
+
+  const uint32_t newestEpisode =
+    ld2410CandidateEvidenceHistoryEpisodeId[
+      newestIndex
+    ];
+
+  bool nearestValid = false;
+
+  uint32_t nearestEpisode = 0;
+  uint8_t nearestIndex = 0;
+
+  float nearestMeanRelativeDelta = 0.0f;
+  float historyDeltaSum = 0.0f;
+  uint8_t priorCount = 0;
+
+  for (
+    uint8_t logicalOffset = 0;
+    logicalOffset <
+      ld2410CandidateEvidenceHistoryCount - 1;
+    ++logicalOffset
+  ) {
+    const uint8_t priorIndex =
+      (
+        oldestIndex + logicalOffset
+      ) %
+      LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY;
+
+    if (priorIndex == newestIndex) {
+      continue;
+    }
+
+    const float stabilityDeltaDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryStabilityDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryStabilityDelta[
+          priorIndex
+        ]
+      );
+
+    const float stabilityMeanDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+          priorIndex
+        ]
+      );
+
+    const float recurrenceDeltaDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+          priorIndex
+        ]
+      );
+
+    const float recurrenceMeanDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+          priorIndex
+        ]
+      );
+
+    const float separationDeltaDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistorySeparationDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistorySeparationDelta[
+          priorIndex
+        ]
+      );
+
+    const float separationMeanDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryFirstDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryStepDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryMeanStepDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+          priorIndex
+        ]
+      );
+
+    const float trajectoryDriftDifference =
+      ld2410CandidateHistoryRelativeDelta(
+        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+          newestIndex
+        ],
+        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+          priorIndex
+        ]
+      );
+
+    const float meanRelativeDelta =
+      (
+        stabilityDeltaDifference +
+        stabilityMeanDifference +
+        recurrenceDeltaDifference +
+        recurrenceMeanDifference +
+        separationDeltaDifference +
+        separationMeanDifference +
+        trajectoryFirstDifference +
+        trajectoryStepDifference +
+        trajectoryMeanStepDifference +
+        trajectoryDriftDifference
+      ) / 10.0f;
+
+    historyDeltaSum += meanRelativeDelta;
+    ++priorCount;
+
+    const uint32_t priorEpisode =
+      ld2410CandidateEvidenceHistoryEpisodeId[
+        priorIndex
+      ];
+
+    if (
+      !nearestValid ||
+      meanRelativeDelta < nearestMeanRelativeDelta
+    ) {
+      nearestValid = true;
+      nearestEpisode = priorEpisode;
+      nearestIndex = priorIndex;
+      nearestMeanRelativeDelta = meanRelativeDelta;
+    }
+  }
+
+  if (!nearestValid || priorCount == 0) {
+    return;
+  }
+
+  const float historyMeanRelativeDelta =
+    historyDeltaSum / (float)priorCount;
+
+  const float nearestAdvantage =
+    historyMeanRelativeDelta -
+    nearestMeanRelativeDelta;
+
+  const float relativeNearestAdvantage =
+    nearestAdvantage /
+    max(
+      historyMeanRelativeDelta,
+      0.00001f
+    );
+
+  Serial.printf(
+    "[MMWAVE CANDIDATE HISTORY MEAN ADVANTAGE] "
+    "newestEpisode=%lu "
+    "nearestEpisode=%lu "
+    "newestIndex=%u "
+    "nearestIndex=%u "
+    "priorCount=%u "
+    "dimensions=10 "
+    "nearestMeanRelativeDelta=%.5f "
+    "historyMeanRelativeDelta=%.5f "
+    "nearestAdvantage=%.5f "
+    "relativeNearestAdvantage=%.5f "
+    "observerOnly=1\n",
+    (unsigned long)newestEpisode,
+    (unsigned long)nearestEpisode,
+    (unsigned int)newestIndex,
+    (unsigned int)nearestIndex,
+    (unsigned int)priorCount,
+    nearestMeanRelativeDelta,
+    historyMeanRelativeDelta,
+    nearestAdvantage,
+    relativeNearestAdvantage
+  );
+}
+
+
+
+// v2.3.22:
+// Reconstruct the already-validated ten-dimensional pairwise mean
+// between two retained candidate-history records.
+//
+// This helper introduces no new evidence dimension or policy.
+static float ld2410CandidateHistoryPairMeanRelativeDelta(
+  uint8_t currentIndex,
+  uint8_t priorIndex
+)
+{
+  const float stabilityDeltaDifference =
+    ld2410CandidateHistoryRelativeDelta(
+      ld2410CandidateEvidenceHistoryStabilityDelta[currentIndex],
+      ld2410CandidateEvidenceHistoryStabilityDelta[priorIndex]
+    );
+
+  const float stabilityMeanDifference =
+    ld2410CandidateHistoryRelativeDelta(
+      ld2410CandidateEvidenceHistoryStabilityMeanDelta[currentIndex],
+      ld2410CandidateEvidenceHistoryStabilityMeanDelta[priorIndex]
+    );
+
+  const float recurrenceDeltaDifference =
+    ld2410CandidateHistoryRelativeDelta(
+      ld2410CandidateEvidenceHistoryRecurrenceDelta[currentIndex],
+      ld2410CandidateEvidenceHistoryRecurrenceDelta[priorIndex]
+    );
+
+  const float recurrenceMeanDifference =
+    ld2410CandidateHistoryRelativeDelta(
+      ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[currentIndex],
+      ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[priorIndex]
+    );
+
+  const float separationDeltaDifference =
+    ld2410CandidateHistoryRelativeDelta(
+      ld2410CandidateEvidenceHistorySeparationDelta[currentIndex],
+      ld2410CandidateEvidenceHistorySeparationDelta[priorIndex]
+    );
+
+  const float separationMeanDifference =
+    ld2410CandidateHistoryRelativeDelta(
+      ld2410CandidateEvidenceHistorySeparationMeanDelta[currentIndex],
+      ld2410CandidateEvidenceHistorySeparationMeanDelta[priorIndex]
+    );
+
+  const float trajectoryFirstDifference =
+    ld2410CandidateHistoryRelativeDelta(
+      ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[currentIndex],
+      ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[priorIndex]
+    );
+
+  const float trajectoryStepDifference =
+    ld2410CandidateHistoryRelativeDelta(
+      ld2410CandidateEvidenceHistoryTrajectoryStepDelta[currentIndex],
+      ld2410CandidateEvidenceHistoryTrajectoryStepDelta[priorIndex]
+    );
+
+  const float trajectoryMeanStepDifference =
+    ld2410CandidateHistoryRelativeDelta(
+      ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[currentIndex],
+      ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[priorIndex]
+    );
+
+  const float trajectoryDriftDifference =
+    ld2410CandidateHistoryRelativeDelta(
+      ld2410CandidateEvidenceHistoryTrajectoryDrift[currentIndex],
+      ld2410CandidateEvidenceHistoryTrajectoryDrift[priorIndex]
+    );
+
+  return (
+    stabilityDeltaDifference +
+    stabilityMeanDifference +
+    recurrenceDeltaDifference +
+    recurrenceMeanDifference +
+    separationDeltaDifference +
+    separationMeanDifference +
+    trajectoryFirstDifference +
+    trajectoryStepDifference +
+    trajectoryMeanStepDifference +
+    trajectoryDriftDifference
+  ) / 10.0f;
+}
+
+
+// v2.3.22:
+// Consolidate previously validated history evidence into one
+// observer-only diagnostic payload.
+//
+// No new threshold, score, classification, promotion, trust,
+// baseline, MQTT, or alert behavior is introduced.
+static void observeLd2410CandidateEpisodeHistoryEvidenceSynthesis()
+{
+  if (ld2410CandidateEvidenceHistoryCount < 3) {
+    return;
+  }
+
+  const uint8_t newestIndex =
+    ld2410CandidateEvidenceHistoryNewestIndex();
+
+  const uint8_t oldestIndex =
+    ld2410CandidateEvidenceHistoryOldestIndex();
+
+  const uint32_t newestEpisode =
+    ld2410CandidateEvidenceHistoryEpisodeId[newestIndex];
+
+  bool nearestValid = false;
+  bool secondNearestValid = false;
+
+  uint32_t nearestEpisode = 0;
+  uint32_t secondNearestEpisode = 0;
+
+  uint8_t nearestIndex = 0;
+  uint8_t secondNearestIndex = 0;
+
+  float nearest = 0.0f;
+  float secondNearest = 0.0f;
+
+  float minimum = 0.0f;
+  float maximum = 0.0f;
+  float sum = 0.0f;
+
+  uint8_t priorCount = 0;
+
+  for (
+    uint8_t logicalOffset = 0;
+    logicalOffset <
+      ld2410CandidateEvidenceHistoryCount - 1;
+    ++logicalOffset
+  ) {
+    const uint8_t priorIndex =
+      (
+        oldestIndex + logicalOffset
+      ) %
+      LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY;
+
+    if (priorIndex == newestIndex) {
+      continue;
+    }
+
+    const float pairMean =
+      ld2410CandidateHistoryPairMeanRelativeDelta(
+        newestIndex,
+        priorIndex
+      );
+
+    const uint32_t priorEpisode =
+      ld2410CandidateEvidenceHistoryEpisodeId[priorIndex];
+
+    if (priorCount == 0) {
+      minimum = pairMean;
+      maximum = pairMean;
+    } else {
+      minimum = min(minimum, pairMean);
+      maximum = max(maximum, pairMean);
+    }
+
+    sum += pairMean;
+    ++priorCount;
+
+    if (!nearestValid || pairMean < nearest) {
+      if (nearestValid) {
+        secondNearestValid = true;
+        secondNearest = nearest;
+        secondNearestEpisode = nearestEpisode;
+        secondNearestIndex = nearestIndex;
+      }
+
+      nearestValid = true;
+      nearest = pairMean;
+      nearestEpisode = priorEpisode;
+      nearestIndex = priorIndex;
+
+    } else if (
+      !secondNearestValid ||
+      pairMean < secondNearest
+    ) {
+      secondNearestValid = true;
+      secondNearest = pairMean;
+      secondNearestEpisode = priorEpisode;
+      secondNearestIndex = priorIndex;
+    }
+  }
+
+  if (
+    !nearestValid ||
+    !secondNearestValid ||
+    priorCount < 2
+  ) {
+    return;
+  }
+
+  const float historyMean =
+    sum / (float)priorCount;
+
+  const float historyRange =
+    maximum - minimum;
+
+  const float absoluteSeparation =
+    secondNearest - nearest;
+
+  const float relativeSeparation =
+    absoluteSeparation /
+    max(secondNearest, 0.00001f);
+
+  const float nearestAdvantage =
+    historyMean - nearest;
+
+  const float relativeNearestAdvantage =
+    nearestAdvantage /
+    max(historyMean, 0.00001f);
+
+  enqueueLd2410EpisodeEvidenceTransport(
+    newestEpisode,
+    nearestEpisode,
+    secondNearestEpisode,
+    ld2410CandidateEvidenceHistoryCount,
+    priorCount,
+    nearest,
+    secondNearest,
+    historyMean,
+    minimum,
+    maximum,
+    historyRange,
+    absoluteSeparation,
+    relativeSeparation,
+    nearestAdvantage,
+    relativeNearestAdvantage,
+    ld2410CandidateEvidenceHistoryEpisodeProfile[newestIndex]
+  );
+
+  Serial.printf(
+    "[MMWAVE CANDIDATE HISTORY EVIDENCE SYNTHESIS] "
+    "newestEpisode=%lu "
+    "nearestEpisode=%lu "
+    "secondNearestEpisode=%lu "
+    "newestIndex=%u "
+    "nearestIndex=%u "
+    "secondNearestIndex=%u "
+    "historyCount=%u "
+    "priorCount=%u "
+    "dimensions=10 "
+    "nearestMeanRelativeDelta=%.5f "
+    "secondNearestMeanRelativeDelta=%.5f "
+    "historyMeanRelativeDelta=%.5f "
+    "historyMinRelativeDelta=%.5f "
+    "historyMaxRelativeDelta=%.5f "
+    "historyRange=%.5f "
+    "absoluteSeparation=%.5f "
+    "relativeSeparation=%.5f "
+    "nearestAdvantage=%.5f "
+    "relativeNearestAdvantage=%.5f "
+    "observerOnly=1\n",
+    (unsigned long)newestEpisode,
+    (unsigned long)nearestEpisode,
+    (unsigned long)secondNearestEpisode,
+    (unsigned int)newestIndex,
+    (unsigned int)nearestIndex,
+    (unsigned int)secondNearestIndex,
+    (unsigned int)ld2410CandidateEvidenceHistoryCount,
+    (unsigned int)priorCount,
+    nearest,
+    secondNearest,
+    historyMean,
+    minimum,
+    maximum,
+    historyRange,
+    absoluteSeparation,
+    relativeSeparation,
+    nearestAdvantage,
+    relativeNearestAdvantage
+  );
+}
+
+
+static void appendLd2410CandidateEvidenceHistory()
+{
+  if (!ld2410CandidateEvidenceValid) {
+    return;
+  }
+
+  const uint8_t slot =
+    ld2410CandidateEvidenceHistoryWriteIndex;
+
+  ld2410CandidateEvidenceHistoryEpisodeId[slot] =
+    ld2410CandidateEvidenceEpisodeId;
+
+  ld2410CandidateEvidenceHistoryStabilitySamples[slot] =
+    ld2410CandidateEvidenceStabilitySamples;
+
+  ld2410CandidateEvidenceHistoryStabilityDelta[slot] =
+    ld2410CandidateEvidenceStabilityDelta;
+
+  ld2410CandidateEvidenceHistoryStabilityMeanDelta[slot] =
+    ld2410CandidateEvidenceStabilityMeanDelta;
+
+  ld2410CandidateEvidenceHistoryRecurrenceSamples[slot] =
+    ld2410CandidateEvidenceRecurrenceSamples;
+
+  ld2410CandidateEvidenceHistoryRecurrenceDelta[slot] =
+    ld2410CandidateEvidenceRecurrenceDelta;
+
+  ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[slot] =
+    ld2410CandidateEvidenceRecurrenceMeanDelta;
+
+  ld2410CandidateEvidenceHistorySeparationSamples[slot] =
+    ld2410CandidateEvidenceSeparationSamples;
+
+  ld2410CandidateEvidenceHistorySeparationDelta[slot] =
+    ld2410CandidateEvidenceSeparationDelta;
+
+  ld2410CandidateEvidenceHistorySeparationMeanDelta[slot] =
+    ld2410CandidateEvidenceSeparationMeanDelta;
+
+  ld2410CandidateEvidenceHistoryTrajectorySamples[slot] =
+    ld2410CandidateEvidenceTrajectorySamples;
+
+  ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[slot] =
+    ld2410CandidateEvidenceTrajectoryFirstDelta;
+
+  ld2410CandidateEvidenceHistoryTrajectoryStepDelta[slot] =
+    ld2410CandidateEvidenceTrajectoryStepDelta;
+
+  ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[slot] =
+    ld2410CandidateEvidenceTrajectoryMeanStepDelta;
+
+  ld2410CandidateEvidenceHistoryTrajectoryDrift[slot] =
+    ld2410CandidateEvidenceTrajectoryDrift;
+
+  // v2.4.2:
+  // captureLd2410CandidateRecurrenceReference() already froze
+  // these values at the real LEARNING -> HELD transition.
+  for (
+    uint8_t profileIndex = 0;
+    profileIndex < LD2410_EPISODE_PROFILE_DIMENSIONS;
+    ++profileIndex
+  ) {
+    ld2410CandidateEvidenceHistoryEpisodeProfile[
+      slot
+    ][profileIndex] =
+      ld2410CandidateRecurrenceReference[profileIndex];
+  }
+
+  if (
+    ld2410CandidateEvidenceHistoryCount <
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ) {
+    ++ld2410CandidateEvidenceHistoryCount;
+  }
+
+  ld2410CandidateEvidenceHistoryWriteIndex =
+    (
+      slot + 1
+    ) %
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY;
+
+  Serial.printf(
+    "[MMWAVE CANDIDATE HISTORY APPEND] "
+    "slot=%u "
+    "count=%u "
+    "capacity=%u "
+    "episodeId=%lu "
+    "stabilitySamples=%lu "
+    "stabilityDelta=%.5f "
+    "stabilityMeanDelta=%.5f "
+    "recurrenceSamples=%lu "
+    "recurrenceDelta=%.5f "
+    "recurrenceMeanDelta=%.5f "
+    "separationSamples=%lu "
+    "separationDelta=%.5f "
+    "separationMeanDelta=%.5f "
+    "trajectorySamples=%lu "
+    "trajectoryFirstDelta=%.5f "
+    "trajectoryStepDelta=%.5f "
+    "trajectoryMeanStepDelta=%.5f "
+    "trajectoryDrift=%.5f "
+    "observerOnly=1\n",
+    (unsigned int)slot,
+    (unsigned int)
+      ld2410CandidateEvidenceHistoryCount,
+    (unsigned int)
+      LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY,
+    (unsigned long)
+      ld2410CandidateEvidenceHistoryEpisodeId[slot],
+    (unsigned long)
+      ld2410CandidateEvidenceHistoryStabilitySamples[slot],
+    ld2410CandidateEvidenceHistoryStabilityDelta[slot],
+    ld2410CandidateEvidenceHistoryStabilityMeanDelta[slot],
+    (unsigned long)
+      ld2410CandidateEvidenceHistoryRecurrenceSamples[slot],
+    ld2410CandidateEvidenceHistoryRecurrenceDelta[slot],
+    ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[slot],
+    (unsigned long)
+      ld2410CandidateEvidenceHistorySeparationSamples[slot],
+    ld2410CandidateEvidenceHistorySeparationDelta[slot],
+    ld2410CandidateEvidenceHistorySeparationMeanDelta[slot],
+    (unsigned long)
+      ld2410CandidateEvidenceHistoryTrajectorySamples[slot],
+    ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[slot],
+    ld2410CandidateEvidenceHistoryTrajectoryStepDelta[slot],
+    ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[slot],
+    ld2410CandidateEvidenceHistoryTrajectoryDrift[slot]
+  );
+
+  // v2.3.16:
+  // Descriptively compare this just-appended completed
+  // episode against all older retained records.
+  observeLd2410CandidateEpisodeHistoryComparison();
+
+  // v2.3.17:
+  // Descriptively summarize this completed episode's
+  // pairwise distances across all older retained episodes.
+  observeLd2410CandidateEpisodeHistoryRecurrenceSummary();
+
+
+  // v2.3.18:
+  // Descriptively identify the nearest retained prior
+  // episode after the completed record has been appended.
+  observeLd2410CandidateEpisodeHistoryNearestPrior();
+
+
+  // v2.3.19:
+  // Descriptively measure the gap between the nearest
+  // and second-nearest retained prior episodes.
+  observeLd2410CandidateEpisodeHistoryNearestSeparation();
+
+
+  // v2.3.20:
+  // Descriptive normalized nearest-vs-runner-up separation.
+  observeLd2410CandidateEpisodeHistoryRelativeSeparation();
+
+
+  // v2.3.21:
+  // Descriptive nearest-vs-full-history mean advantage.
+  observeLd2410CandidateEpisodeHistoryMeanAdvantage();
+
+
+  // v2.3.22:
+  // Consolidated observer-only history evidence payload.
+  observeLd2410CandidateEpisodeHistoryEvidenceSynthesis();
+}
+
+
+static uint8_t ld2410CandidateEvidenceHistoryOldestIndex()
+{
+  if (ld2410CandidateEvidenceHistoryCount == 0) {
+    return 0;
+  }
+
+  if (
+    ld2410CandidateEvidenceHistoryCount <
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY
+  ) {
+    return 0;
+  }
+
+  return ld2410CandidateEvidenceHistoryWriteIndex;
+}
+
+
+static uint8_t ld2410CandidateEvidenceHistoryNewestIndex()
+{
+  if (ld2410CandidateEvidenceHistoryCount == 0) {
+    return 0;
+  }
+
+  return (
+    ld2410CandidateEvidenceHistoryWriteIndex +
+    LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY -
+    1
+  ) %
+  LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY;
+}
+
+
+// ------------------------------------------------------------
+// v2.3.14 completed-episode evidence snapshot.
+//
+// Called after the existing candidate observers.
+//
+// A snapshot is committed only at the real transition:
+//
+//   candidate LEARNING -> HELD
+//
+// Existing observer values have already stopped changing by
+// this point, so this simply freezes their completed values
+// into one RAM-only record.
+// ------------------------------------------------------------
+
+static void captureLd2410CandidateEpisodeEvidence()
+{
+  const bool learning =
+    (
+      ld2410CandidateBaselineState ==
+      LD2410_CANDIDATE_STATE_LEARNING
+    );
+
+  const bool held =
+    (
+      ld2410CandidateBaselineState ==
+      LD2410_CANDIDATE_STATE_HELD
+    );
+
+  if (
+    held &&
+    ld2410CandidateEvidenceWasLearning
+  )
+  {
+    ld2410CandidateEvidenceEpisodeId =
+      ld2410CandidateEpisodeId;
+
+    ld2410CandidateEvidenceStabilitySamples =
+      ld2410CandidateStabilitySamples;
+
+    ld2410CandidateEvidenceStabilityDelta =
+      ld2410CandidateWindowDelta;
+
+    ld2410CandidateEvidenceStabilityMeanDelta =
+      ld2410CandidateMeanDelta;
+
+    ld2410CandidateEvidenceRecurrenceSamples =
+      ld2410CandidateRecurrenceSamples;
+
+    ld2410CandidateEvidenceRecurrenceDelta =
+      ld2410CandidateRecurrenceDelta;
+
+    ld2410CandidateEvidenceRecurrenceMeanDelta =
+      ld2410CandidateRecurrenceMeanDelta;
+
+    ld2410CandidateEvidenceSeparationSamples =
+      ld2410CandidateSeparationSamples;
+
+    ld2410CandidateEvidenceSeparationDelta =
+      ld2410CandidateSeparationDelta;
+
+    ld2410CandidateEvidenceSeparationMeanDelta =
+      ld2410CandidateSeparationMeanDelta;
+
+    ld2410CandidateEvidenceTrajectorySamples =
+      ld2410CandidateTrajectorySamples;
+
+    ld2410CandidateEvidenceTrajectoryFirstDelta =
+      ld2410CandidateTrajectoryFirstDelta;
+
+    ld2410CandidateEvidenceTrajectoryStepDelta =
+      ld2410CandidateTrajectoryStepDelta;
+
+    ld2410CandidateEvidenceTrajectoryMeanStepDelta =
+      ld2410CandidateTrajectoryMeanStepDelta;
+
+    ld2410CandidateEvidenceTrajectoryDrift =
+      ld2410CandidateTrajectoryEpisodeDrift;
+
+    ld2410CandidateEvidenceValid = true;
+
+    // v2.3.15:
+    // Preserve this just-completed v2.3.14 snapshot in the
+    // fixed-size RAM-only history exactly once.
+    appendLd2410CandidateEvidenceHistory();
+  }
+
+  ld2410CandidateEvidenceWasLearning =
+    learning;
+}
+
+
+
+
+
+
+
+static void updateLd2410CandidateBaseline(
+  uint8_t movingPct,
+  uint8_t stationaryPct,
+  uint8_t target2Pct,
+  uint8_t target3Pct,
+  uint8_t transitionCount,
+  uint16_t movingMedian,
+  uint16_t movingIqr,
+  uint16_t stationaryMedian,
+  uint16_t stationaryIqr,
+  uint16_t detectionMedian,
+  uint8_t movingEnergyMedian,
+  uint8_t stationaryEnergyMedian
+) {
+  const bool persistentNow =
+    ld2410EligibilityState ==
+    LD2410_ELIGIBILITY_PERSISTENT_CANDIDATE;
+
+  if (!persistentNow) {
+    if (
+      ld2410CandidateBaselineState ==
+      LD2410_CANDIDATE_STATE_LEARNING
+    ) {
+      // v2.3.11 observer-only capture.
+      // Preserve the completed candidate before state changes.
+      captureLd2410CandidateRecurrenceReference();
+
+      setLd2410CandidateState(
+        LD2410_CANDIDATE_STATE_HELD
+      );
+
+      ld2410CandidateHeldAt = millis();
+    }
+
+  } else {
+    // A new persistent episode starts a fresh quarantined
+    // candidate. A held candidate is never silently merged.
+    if (
+      ld2410CandidateBaselineState !=
+        LD2410_CANDIDATE_STATE_LEARNING ||
+      ld2410CandidateEpisodeId !=
+        ld2410EpisodeId
+    ) {
+      ld2410CandidateInitialized = false;
+      ld2410CandidateWindowCount = 0;
+
+      ld2410CandidateEpisodeId =
+        ld2410EpisodeId;
+
+      ld2410CandidateStartedAt = millis();
+      ld2410CandidateHeldAt = 0;
+
+      setLd2410CandidateState(
+        LD2410_CANDIDATE_STATE_LEARNING
+      );
+    }
+
+    if (!ld2410CandidateInitialized) {
+      initializeLd2410CandidateBaseline(
+        movingPct,
+        stationaryPct,
+        target2Pct,
+        target3Pct,
+        transitionCount,
+        movingMedian,
+        movingIqr,
+        stationaryMedian,
+        stationaryIqr,
+        detectionMedian,
+        movingEnergyMedian,
+        stationaryEnergyMedian
+      );
+
+    } else {
+      updateAdaptiveMetric(
+        ld2410CandidateMovingPct.mean,
+        ld2410CandidateMovingPct.deviation,
+        movingPct,
+        LD2410_CANDIDATE_ALPHA
+      );
+
+      updateAdaptiveMetric(
+        ld2410CandidateStationaryPct.mean,
+        ld2410CandidateStationaryPct.deviation,
+        stationaryPct,
+        LD2410_CANDIDATE_ALPHA
+      );
+
+      updateAdaptiveMetric(
+        ld2410CandidateTarget2Pct.mean,
+        ld2410CandidateTarget2Pct.deviation,
+        target2Pct,
+        LD2410_CANDIDATE_ALPHA
+      );
+
+      updateAdaptiveMetric(
+        ld2410CandidateTarget3Pct.mean,
+        ld2410CandidateTarget3Pct.deviation,
+        target3Pct,
+        LD2410_CANDIDATE_ALPHA
+      );
+
+      updateAdaptiveMetric(
+        ld2410CandidateFlips.mean,
+        ld2410CandidateFlips.deviation,
+        transitionCount,
+        LD2410_CANDIDATE_ALPHA
+      );
+
+      updateAdaptiveMetric(
+        ld2410CandidateMovingDistance.mean,
+        ld2410CandidateMovingDistance.deviation,
+        movingMedian,
+        LD2410_CANDIDATE_ALPHA
+      );
+
+      updateAdaptiveMetric(
+        ld2410CandidateMovingIqr.mean,
+        ld2410CandidateMovingIqr.deviation,
+        movingIqr,
+        LD2410_CANDIDATE_ALPHA
+      );
+
+      updateAdaptiveMetric(
+        ld2410CandidateStationaryDistance.mean,
+        ld2410CandidateStationaryDistance.deviation,
+        stationaryMedian,
+        LD2410_CANDIDATE_ALPHA
+      );
+
+      updateAdaptiveMetric(
+        ld2410CandidateStationaryIqr.mean,
+        ld2410CandidateStationaryIqr.deviation,
+        stationaryIqr,
+        LD2410_CANDIDATE_ALPHA
+      );
+
+      updateAdaptiveMetric(
+        ld2410CandidateDetectionDistance.mean,
+        ld2410CandidateDetectionDistance.deviation,
+        detectionMedian,
+        LD2410_CANDIDATE_ALPHA
+      );
+
+      updateAdaptiveMetric(
+        ld2410CandidateMovingEnergy.mean,
+        ld2410CandidateMovingEnergy.deviation,
+        movingEnergyMedian,
+        LD2410_CANDIDATE_ALPHA
+      );
+
+      updateAdaptiveMetric(
+        ld2410CandidateStationaryEnergy.mean,
+        ld2410CandidateStationaryEnergy.deviation,
+        stationaryEnergyMedian,
+        LD2410_CANDIDATE_ALPHA
+      );
+    }
+
+    ++ld2410CandidateWindowCount;
+  }
+
+  if (
+    millis() - ld2410CandidateLastSerialAt <
+      LD2410_CANDIDATE_SERIAL_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  ld2410CandidateLastSerialAt = millis();
+
+  unsigned long ageMs = 0;
+
+  if (
+    ld2410CandidateInitialized &&
+    ld2410CandidateStartedAt > 0
+  ) {
+    ageMs =
+      millis() - ld2410CandidateStartedAt;
+  }
+
+  unsigned long heldAgeMs = 0;
+
+  if (
+    ld2410CandidateBaselineState ==
+      LD2410_CANDIDATE_STATE_HELD &&
+    ld2410CandidateHeldAt > 0
+  ) {
+    heldAgeMs =
+      millis() - ld2410CandidateHeldAt;
+  }
+
+  
+  observeLd2410CandidateStability(
+    movingPct,
+    stationaryPct,
+    target2Pct,
+    target3Pct,
+    transitionCount,
+    movingMedian,
+    movingIqr,
+    stationaryMedian,
+    stationaryIqr,
+    detectionMedian,
+    movingEnergyMedian,
+    stationaryEnergyMedian
+  );
+
+  observeLd2410CandidateRecurrence();
+  observeLd2410CandidateTrustedSeparation();
+  observeLd2410CandidateSeparationTrajectory();
+  captureLd2410CandidateEpisodeEvidence();
+
+  Serial.printf(
+    "[MMWAVE CANDIDATE STABILITY] "
+    "state=%s "
+    "samples=%lu "
+    "delta=%.5f "
+    "meanDelta=%.5f "
+    "trend=%.5f "
+    "observerOnly=1\n",
+    ld2410CandidateBaselineStateName(
+      ld2410CandidateBaselineState
+    ),
+    (unsigned long)ld2410CandidateStabilitySamples,
+    ld2410CandidateWindowDelta,
+    ld2410CandidateMeanDelta,
+    ld2410CandidateTrendDelta
+  );
+
+  Serial.printf(
+    "[MMWAVE CANDIDATE RECURRENCE] "
+    "referenceValid=%u "
+    "referenceEpisode=%lu "
+    "currentEpisode=%lu "
+    "samples=%lu "
+    "delta=%.5f "
+    "meanDelta=%.5f "
+    "observerOnly=1\n",
+    ld2410CandidateRecurrenceReferenceValid ? 1 : 0,
+    (unsigned long)
+      ld2410CandidateRecurrenceReferenceEpisodeId,
+    (unsigned long)
+      ld2410CandidateRecurrenceCurrentEpisodeId,
+    (unsigned long)
+      ld2410CandidateRecurrenceSamples,
+    ld2410CandidateRecurrenceDelta,
+    ld2410CandidateRecurrenceMeanDelta
+  );
+
+
+
+
+  Serial.printf(
+    "[MMWAVE CANDIDATE SEPARATION] "
+    "state=%s "
+    "samples=%lu "
+    "delta=%.5f "
+    "meanDelta=%.5f "
+    "observerOnly=1\n",
+    ld2410CandidateBaselineStateName(
+      ld2410CandidateBaselineState
+    ),
+    (unsigned long)
+      ld2410CandidateSeparationSamples,
+    ld2410CandidateSeparationDelta,
+    ld2410CandidateSeparationMeanDelta
+  );
+
+
+
+  Serial.printf(
+    "[MMWAVE CANDIDATE TRAJECTORY] "
+    "state=%s "
+    "samples=%lu "
+    "firstDelta=%.5f "
+    "stepDelta=%.5f "
+    "meanStepDelta=%.5f "
+    "episodeDrift=%.5f "
+    "observerOnly=1\n",
+    ld2410CandidateBaselineStateName(
+      ld2410CandidateBaselineState
+    ),
+    (unsigned long)
+      ld2410CandidateTrajectorySamples,
+    ld2410CandidateTrajectoryFirstDelta,
+    ld2410CandidateTrajectoryStepDelta,
+    ld2410CandidateTrajectoryMeanStepDelta,
+    ld2410CandidateTrajectoryEpisodeDrift
+  );
+
+
+
+  Serial.printf(
+    "[MMWAVE CANDIDATE EVIDENCE] "
+    "valid=%u "
+    "episodeId=%lu "
+    "stabilitySamples=%lu "
+    "stabilityDelta=%.5f "
+    "stabilityMeanDelta=%.5f "
+    "recurrenceSamples=%lu "
+    "recurrenceDelta=%.5f "
+    "recurrenceMeanDelta=%.5f "
+    "separationSamples=%lu "
+    "separationDelta=%.5f "
+    "separationMeanDelta=%.5f "
+    "trajectorySamples=%lu "
+    "trajectoryFirstDelta=%.5f "
+    "trajectoryStepDelta=%.5f "
+    "trajectoryMeanStepDelta=%.5f "
+    "trajectoryDrift=%.5f "
+    "observerOnly=1\n",
+    ld2410CandidateEvidenceValid ? 1U : 0U,
+    (unsigned long)
+      ld2410CandidateEvidenceEpisodeId,
+    (unsigned long)
+      ld2410CandidateEvidenceStabilitySamples,
+    ld2410CandidateEvidenceStabilityDelta,
+    ld2410CandidateEvidenceStabilityMeanDelta,
+    (unsigned long)
+      ld2410CandidateEvidenceRecurrenceSamples,
+    ld2410CandidateEvidenceRecurrenceDelta,
+    ld2410CandidateEvidenceRecurrenceMeanDelta,
+    (unsigned long)
+      ld2410CandidateEvidenceSeparationSamples,
+    ld2410CandidateEvidenceSeparationDelta,
+    ld2410CandidateEvidenceSeparationMeanDelta,
+    (unsigned long)
+      ld2410CandidateEvidenceTrajectorySamples,
+    ld2410CandidateEvidenceTrajectoryFirstDelta,
+    ld2410CandidateEvidenceTrajectoryStepDelta,
+    ld2410CandidateEvidenceTrajectoryMeanStepDelta,
+    ld2410CandidateEvidenceTrajectoryDrift
+  );
+
+  if (ld2410CandidateEvidenceHistoryCount > 0) {
+    const uint8_t historyOldestIndex =
+      ld2410CandidateEvidenceHistoryOldestIndex();
+
+    const uint8_t historyNewestIndex =
+      ld2410CandidateEvidenceHistoryNewestIndex();
+
+    Serial.printf(
+      "[MMWAVE CANDIDATE HISTORY] "
+      "count=%u "
+      "capacity=%u "
+      "writeIndex=%u "
+      "oldestIndex=%u "
+      "oldestEpisode=%lu "
+      "newestIndex=%u "
+      "newestEpisode=%lu "
+      "observerOnly=1\n",
+      (unsigned int)
+        ld2410CandidateEvidenceHistoryCount,
+      (unsigned int)
+        LD2410_CANDIDATE_EVIDENCE_HISTORY_CAPACITY,
+      (unsigned int)
+        ld2410CandidateEvidenceHistoryWriteIndex,
+      (unsigned int)
+        historyOldestIndex,
+      (unsigned long)
+        ld2410CandidateEvidenceHistoryEpisodeId[
+          historyOldestIndex
+        ],
+      (unsigned int)
+        historyNewestIndex,
+      (unsigned long)
+        ld2410CandidateEvidenceHistoryEpisodeId[
+          historyNewestIndex
+        ]
+    );
+  }
+
+
+Serial.printf(
+    "[MMWAVE CANDIDATE] "
+    "state=%s "
+    "episodeId=%lu "
+    "windows=%lu "
+    "ageMs=%lu "
+    "heldAgeMs=%lu "
+    "alpha=%.3f "
+    "move=%.1f+/-%.1f "
+    "stationary=%.1f+/-%.1f "
+    "t2=%.1f+/-%.1f "
+    "t3=%.1f+/-%.1f "
+    "flips=%.1f+/-%.1f "
+    "moveMed=%.1f+/-%.1f "
+    "moveIQR=%.1f+/-%.1f "
+    "staticMed=%.1f+/-%.1f "
+    "staticIQR=%.1f+/-%.1f "
+    "detectMed=%.1f+/-%.1f "
+    "moveEnergy=%.1f+/-%.1f "
+    "staticEnergy=%.1f+/-%.1f "
+    "observerOnly=1\n",
+
+    ld2410CandidateBaselineStateName(
+      ld2410CandidateBaselineState
+    ),
+
+    (unsigned long)
+      ld2410CandidateEpisodeId,
+
+    (unsigned long)
+      ld2410CandidateWindowCount,
+
+    (unsigned long)ageMs,
+    (unsigned long)heldAgeMs,
+
+    LD2410_CANDIDATE_ALPHA,
+
+    ld2410CandidateMovingPct.mean,
+    ld2410CandidateMovingPct.deviation,
+
+    ld2410CandidateStationaryPct.mean,
+    ld2410CandidateStationaryPct.deviation,
+
+    ld2410CandidateTarget2Pct.mean,
+    ld2410CandidateTarget2Pct.deviation,
+
+    ld2410CandidateTarget3Pct.mean,
+    ld2410CandidateTarget3Pct.deviation,
+
+    ld2410CandidateFlips.mean,
+    ld2410CandidateFlips.deviation,
+
+    ld2410CandidateMovingDistance.mean,
+    ld2410CandidateMovingDistance.deviation,
+
+    ld2410CandidateMovingIqr.mean,
+    ld2410CandidateMovingIqr.deviation,
+
+    ld2410CandidateStationaryDistance.mean,
+    ld2410CandidateStationaryDistance.deviation,
+
+    ld2410CandidateStationaryIqr.mean,
+    ld2410CandidateStationaryIqr.deviation,
+
+    ld2410CandidateDetectionDistance.mean,
+    ld2410CandidateDetectionDistance.deviation,
+
+    ld2410CandidateMovingEnergy.mean,
+    ld2410CandidateMovingEnergy.deviation,
+
+    ld2410CandidateStationaryEnergy.mean,
+    ld2410CandidateStationaryEnergy.deviation
+  );
+}
+
+
+void updateLd2410AdaptiveBaseline(
+  uint8_t movingPct,
+  uint8_t stationaryPct,
+  uint8_t target2Pct,
+  uint8_t target3Pct,
+  uint8_t transitionCount,
+  uint16_t movingMedian,
+  uint16_t movingIqr,
+  uint16_t stationaryMedian,
+  uint16_t stationaryIqr,
+  uint16_t detectionMedian,
+  uint8_t movingEnergyMedian,
+  uint8_t stationaryEnergyMedian
+) {
+  // Learn only from a complete local feature window.
+  if (
+    ld2410FeatureCount <
+    LD2410_FEATURE_WINDOW_SIZE
+  ) {
+    return;
+  }
+
+  // GPIO21 remains authoritative for occupancy.
+  if (
+    digitalRead(PRESENCE_PIN) !=
+    PRESENCE_ACTIVE_STATE
+  ) {
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // Protected learning
+  //
+  // Warmup windows are learned normally.
+  //
+  // After warmup, independently useful feature groups are compared
+  // with the current local baseline. Redundant fields such as
+  // target-2 / target-3 complements are intentionally not used to
+  // multiply the same evidence.
+  //
+  // A strong outlier requires either:
+  //   - at least two independent feature groups > 4 normalized
+  //     baseline deviations, OR
+  //   - one extreme feature > 8 normalized deviations.
+  //
+  // Strong outliers are DOWN-WEIGHTED, not discarded forever.
+  // This protects the baseline while preserving slow adaptation.
+  // ----------------------------------------------------------
+
+  float selectedAlpha = LD2410_BASELINE_ALPHA;
+  uint8_t outlierDimensions = 0;
+  float maximumOutlierScore = 0.0f;
+  bool downweightWindow = false;
+
+  if (
+    ld2410BaselineInitialized &&
+    ld2410BaselineWindowCount >=
+      LD2410_BASELINE_WARMUP_WINDOWS
+  ) {
+    float scoreMove =
+      ld2410NormalizedBaselineDifference(
+        movingPct,
+        ld2410BaselineMovingPct.mean,
+        ld2410BaselineMovingPct.deviation,
+        LD2410_BASELINE_MOVE_DEV_FLOOR
+      );
+
+    float scoreFlips =
+      ld2410NormalizedBaselineDifference(
+        transitionCount,
+        ld2410BaselineFlips.mean,
+        ld2410BaselineFlips.deviation,
+        LD2410_BASELINE_FLIPS_DEV_FLOOR
+      );
+
+    float scoreMoveDistance =
+      ld2410NormalizedBaselineDifference(
+        movingMedian,
+        ld2410BaselineMovingDistance.mean,
+        ld2410BaselineMovingDistance.deviation,
+        LD2410_BASELINE_DISTANCE_DEV_FLOOR
+      );
+
+    float scoreMoveIqr =
+      ld2410NormalizedBaselineDifference(
+        movingIqr,
+        ld2410BaselineMovingIqr.mean,
+        ld2410BaselineMovingIqr.deviation,
+        LD2410_BASELINE_IQR_DEV_FLOOR
+      );
+
+    float scoreStaticDistance =
+      ld2410NormalizedBaselineDifference(
+        stationaryMedian,
+        ld2410BaselineStationaryDistance.mean,
+        ld2410BaselineStationaryDistance.deviation,
+        LD2410_BASELINE_DISTANCE_DEV_FLOOR
+      );
+
+    float scoreStaticIqr =
+      ld2410NormalizedBaselineDifference(
+        stationaryIqr,
+        ld2410BaselineStationaryIqr.mean,
+        ld2410BaselineStationaryIqr.deviation,
+        LD2410_BASELINE_IQR_DEV_FLOOR
+      );
+
+    float scoreDetection =
+      ld2410NormalizedBaselineDifference(
+        detectionMedian,
+        ld2410BaselineDetectionDistance.mean,
+        ld2410BaselineDetectionDistance.deviation,
+        LD2410_BASELINE_DETECTION_DEV_FLOOR
+      );
+
+    float scores[] = {
+      scoreMove,
+      scoreFlips,
+      scoreMoveDistance,
+      scoreMoveIqr,
+      scoreStaticDistance,
+      scoreStaticIqr,
+      scoreDetection
+    };
+
+    const uint8_t scoreCount =
+      sizeof(scores) / sizeof(scores[0]);
+
+    for (uint8_t i = 0; i < scoreCount; ++i) {
+      if (scores[i] > maximumOutlierScore) {
+        maximumOutlierScore = scores[i];
+      }
+
+      if (
+        scores[i] >=
+        LD2410_BASELINE_OUTLIER_SCORE
+      ) {
+        ++outlierDimensions;
+      }
+    }
+
+    downweightWindow =
+      outlierDimensions >= 2 ||
+      maximumOutlierScore >=
+        LD2410_BASELINE_EXTREME_SCORE;
+
+    if (downweightWindow) {
+      selectedAlpha =
+        LD2410_BASELINE_OUTLIER_ALPHA;
+    }
+  }
+
+  // v2.3.5 temporal deviation observes the current feature
+  // vector against the PRE-UPDATE baseline.
+  //
+  // Do this before adapting the baseline so the current window
+  // cannot partially normalize itself before being observed.
+  if (
+    ld2410BaselineInitialized &&
+    ld2410BaselineWindowCount >=
+      LD2410_BASELINE_WARMUP_WINDOWS
+  ) {
+    updateLd2410TemporalDeviation(
+      maximumOutlierScore,
+      outlierDimensions,
+      downweightWindow
+    );
+
+    // --------------------------------------------------------
+    // v2.3.8 ADAPTATION ELIGIBILITY ENFORCEMENT
+    //
+    // Eligibility has now been updated for THIS feature window.
+    //
+    // normal_learning:
+    //   keep existing selectedAlpha behavior.
+    //
+    // protected_episode:
+    //   never learn faster than the existing protected alpha.
+    //
+    // persistent_candidate:
+    //   quarantine this behavior from baseline absorption by
+    //   freezing learning for this window.
+    // --------------------------------------------------------
+
+    ld2410BaselineLastEligibilityProtected = false;
+    ld2410BaselineLastEligibilityFrozen = false;
+
+    if (
+      ld2410EligibilityState ==
+      LD2410_ELIGIBILITY_PERSISTENT_CANDIDATE
+    ) {
+      selectedAlpha =
+        LD2410_BASELINE_PERSISTENT_ALPHA;
+
+      ld2410BaselineLastEligibilityFrozen = true;
+
+      ++ld2410BaselineEligibilityFrozenWindows;
+
+    } else if (
+      ld2410EligibilityState ==
+      LD2410_ELIGIBILITY_PROTECTED_EPISODE
+    ) {
+      if (
+        selectedAlpha >
+        LD2410_BASELINE_OUTLIER_ALPHA
+      ) {
+        selectedAlpha =
+          LD2410_BASELINE_OUTLIER_ALPHA;
+      }
+
+      ld2410BaselineLastEligibilityProtected = true;
+
+      ++ld2410BaselineEligibilityProtectedWindows;
+    }
+
+    // --------------------------------------------------------
+    // v2.3.9 QUARANTINED CANDIDATE BASELINE OBSERVER
+    //
+    // Current-window eligibility is already known.
+    // The trusted baseline has NOT yet been updated.
+    //
+    // This observer learns a separate RAM-only profile only
+    // while persistent_candidate is active.
+    //
+    // It cannot alter selectedAlpha or the trusted baseline.
+    // --------------------------------------------------------
+
+    updateLd2410CandidateBaseline(
+      movingPct,
+      stationaryPct,
+      target2Pct,
+      target3Pct,
+      transitionCount,
+      movingMedian,
+      movingIqr,
+      stationaryMedian,
+      stationaryIqr,
+      detectionMedian,
+      movingEnergyMedian,
+      stationaryEnergyMedian
+    );
+  }
+
+  ld2410BaselineLastOutlierDimensions =
+    outlierDimensions;
+
+  ld2410BaselineLastMaxOutlierScore =
+    maximumOutlierScore;
+
+  ld2410BaselineLastAppliedAlpha =
+    selectedAlpha;
+
+  ld2410BaselineLastWindowDownweighted =
+    downweightWindow;
+
+  Serial.printf(
+    "[MMWAVE LEARNING POLICY] "
+    "eligibility=%s "
+    "alpha=%.3f "
+    "protected=%u "
+    "frozen=%u "
+    "protectedWindows=%lu "
+    "frozenWindows=%lu\n",
+    ld2410EligibilityStateName(
+      ld2410EligibilityState
+    ),
+    ld2410BaselineLastAppliedAlpha,
+    ld2410BaselineLastEligibilityProtected ? 1U : 0U,
+    ld2410BaselineLastEligibilityFrozen ? 1U : 0U,
+    (unsigned long)
+      ld2410BaselineEligibilityProtectedWindows,
+    (unsigned long)
+      ld2410BaselineEligibilityFrozenWindows
+  );
+
+  if (!ld2410BaselineInitialized) {
+    initializeAdaptiveMetric(
+      ld2410BaselineMovingPct.mean,
+      ld2410BaselineMovingPct.deviation,
+      movingPct
+    );
+
+    initializeAdaptiveMetric(
+      ld2410BaselineStationaryPct.mean,
+      ld2410BaselineStationaryPct.deviation,
+      stationaryPct
+    );
+
+    initializeAdaptiveMetric(
+      ld2410BaselineTarget2Pct.mean,
+      ld2410BaselineTarget2Pct.deviation,
+      target2Pct
+    );
+
+    initializeAdaptiveMetric(
+      ld2410BaselineTarget3Pct.mean,
+      ld2410BaselineTarget3Pct.deviation,
+      target3Pct
+    );
+
+    initializeAdaptiveMetric(
+      ld2410BaselineFlips.mean,
+      ld2410BaselineFlips.deviation,
+      transitionCount
+    );
+
+    initializeAdaptiveMetric(
+      ld2410BaselineMovingDistance.mean,
+      ld2410BaselineMovingDistance.deviation,
+      movingMedian
+    );
+
+    initializeAdaptiveMetric(
+      ld2410BaselineMovingIqr.mean,
+      ld2410BaselineMovingIqr.deviation,
+      movingIqr
+    );
+
+    initializeAdaptiveMetric(
+      ld2410BaselineStationaryDistance.mean,
+      ld2410BaselineStationaryDistance.deviation,
+      stationaryMedian
+    );
+
+    initializeAdaptiveMetric(
+      ld2410BaselineStationaryIqr.mean,
+      ld2410BaselineStationaryIqr.deviation,
+      stationaryIqr
+    );
+
+    initializeAdaptiveMetric(
+      ld2410BaselineDetectionDistance.mean,
+      ld2410BaselineDetectionDistance.deviation,
+      detectionMedian
+    );
+
+    initializeAdaptiveMetric(
+      ld2410BaselineMovingEnergy.mean,
+      ld2410BaselineMovingEnergy.deviation,
+      movingEnergyMedian
+    );
+
+    initializeAdaptiveMetric(
+      ld2410BaselineStationaryEnergy.mean,
+      ld2410BaselineStationaryEnergy.deviation,
+      stationaryEnergyMedian
+    );
+
+    ld2410BaselineInitialized = true;
+  } else {
+    updateAdaptiveMetric(
+      ld2410BaselineMovingPct.mean,
+      ld2410BaselineMovingPct.deviation,
+      movingPct,
+      selectedAlpha
+    );
+
+    updateAdaptiveMetric(
+      ld2410BaselineStationaryPct.mean,
+      ld2410BaselineStationaryPct.deviation,
+      stationaryPct,
+      selectedAlpha
+    );
+
+    updateAdaptiveMetric(
+      ld2410BaselineTarget2Pct.mean,
+      ld2410BaselineTarget2Pct.deviation,
+      target2Pct,
+      selectedAlpha
+    );
+
+    updateAdaptiveMetric(
+      ld2410BaselineTarget3Pct.mean,
+      ld2410BaselineTarget3Pct.deviation,
+      target3Pct,
+      selectedAlpha
+    );
+
+    updateAdaptiveMetric(
+      ld2410BaselineFlips.mean,
+      ld2410BaselineFlips.deviation,
+      transitionCount,
+      selectedAlpha
+    );
+
+    updateAdaptiveMetric(
+      ld2410BaselineMovingDistance.mean,
+      ld2410BaselineMovingDistance.deviation,
+      movingMedian,
+      selectedAlpha
+    );
+
+    updateAdaptiveMetric(
+      ld2410BaselineMovingIqr.mean,
+      ld2410BaselineMovingIqr.deviation,
+      movingIqr,
+      selectedAlpha
+    );
+
+    updateAdaptiveMetric(
+      ld2410BaselineStationaryDistance.mean,
+      ld2410BaselineStationaryDistance.deviation,
+      stationaryMedian,
+      selectedAlpha
+    );
+
+    updateAdaptiveMetric(
+      ld2410BaselineStationaryIqr.mean,
+      ld2410BaselineStationaryIqr.deviation,
+      stationaryIqr,
+      selectedAlpha
+    );
+
+    updateAdaptiveMetric(
+      ld2410BaselineDetectionDistance.mean,
+      ld2410BaselineDetectionDistance.deviation,
+      detectionMedian,
+      selectedAlpha
+    );
+
+    updateAdaptiveMetric(
+      ld2410BaselineMovingEnergy.mean,
+      ld2410BaselineMovingEnergy.deviation,
+      movingEnergyMedian,
+      selectedAlpha
+    );
+
+    updateAdaptiveMetric(
+      ld2410BaselineStationaryEnergy.mean,
+      ld2410BaselineStationaryEnergy.deviation,
+      stationaryEnergyMedian,
+      selectedAlpha
+    );
+  }
+
+  if (downweightWindow) {
+    ++ld2410BaselineDownweightedWindows;
+  } else {
+    ++ld2410BaselineFullRateWindows;
+  }
+
+  ++ld2410BaselineWindowCount;
+
+  if (
+    millis() - ld2410BaselineLastSerialAt <
+    LD2410_BASELINE_SERIAL_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  ld2410BaselineLastSerialAt = millis();
+
+  const char* phase =
+    ld2410BaselineWindowCount <
+      LD2410_BASELINE_WARMUP_WINDOWS
+      ? "warmup"
+      : "learning";
+
+  Serial.printf(
+    "[MMWAVE BASELINE] "
+    "phase=%s "
+    "windows=%lu "
+    "move=%.1f+/-%.1f "
+    "stationary=%.1f+/-%.1f "
+    "t2=%.1f+/-%.1f "
+    "t3=%.1f+/-%.1f "
+    "flips=%.1f+/-%.1f "
+    "moveMed=%.1f+/-%.1f "
+    "moveIQR=%.1f+/-%.1f "
+    "staticMed=%.1f+/-%.1f "
+    "staticIQR=%.1f+/-%.1f "
+    "detectMed=%.1f+/-%.1f "
+    "moveEnergy=%.1f+/-%.1f "
+    "staticEnergy=%.1f+/-%.1f "
+    "guard=%s "
+    "outlierDims=%u "
+    "maxScore=%.2f "
+    "alpha=%.3f "
+    "full=%lu "
+    "downweighted=%lu\n",
+    phase,
+    (unsigned long)ld2410BaselineWindowCount,
+
+    ld2410BaselineMovingPct.mean,
+    ld2410BaselineMovingPct.deviation,
+
+    ld2410BaselineStationaryPct.mean,
+    ld2410BaselineStationaryPct.deviation,
+
+    ld2410BaselineTarget2Pct.mean,
+    ld2410BaselineTarget2Pct.deviation,
+
+    ld2410BaselineTarget3Pct.mean,
+    ld2410BaselineTarget3Pct.deviation,
+
+    ld2410BaselineFlips.mean,
+    ld2410BaselineFlips.deviation,
+
+    ld2410BaselineMovingDistance.mean,
+    ld2410BaselineMovingDistance.deviation,
+
+    ld2410BaselineMovingIqr.mean,
+    ld2410BaselineMovingIqr.deviation,
+
+    ld2410BaselineStationaryDistance.mean,
+    ld2410BaselineStationaryDistance.deviation,
+
+    ld2410BaselineStationaryIqr.mean,
+    ld2410BaselineStationaryIqr.deviation,
+
+    ld2410BaselineDetectionDistance.mean,
+    ld2410BaselineDetectionDistance.deviation,
+
+    ld2410BaselineMovingEnergy.mean,
+    ld2410BaselineMovingEnergy.deviation,
+
+    ld2410BaselineStationaryEnergy.mean,
+    ld2410BaselineStationaryEnergy.deviation,
+
+    ld2410BaselineWindowCount <
+      LD2410_BASELINE_WARMUP_WINDOWS
+        ? "warmup"
+        : (
+            ld2410BaselineLastWindowDownweighted
+              ? "downweighted"
+              : "normal"
+          ),
+
+    (unsigned int)
+      ld2410BaselineLastOutlierDimensions,
+
+    ld2410BaselineLastMaxOutlierScore,
+
+    ld2410BaselineLastAppliedAlpha,
+
+    (unsigned long)
+      ld2410BaselineFullRateWindows,
+
+    (unsigned long)
+      ld2410BaselineDownweightedWindows
+  );
+}
+
+
+void publishLd2410FeatureSerial() {
+  if (!LD2410_FEATURE_SERIAL_ENABLED) return;
+
+  if (ld2410FeatureCount < 5) return;
+
+  if (
+    millis() - ld2410FeatureLastSerialAt <
+    LD2410_FEATURE_SERIAL_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  ld2410FeatureLastSerialAt = millis();
+
+  uint8_t movingCount = 0;
+  uint8_t stationaryCount = 0;
+  uint8_t target2Count = 0;
+  uint8_t target3Count = 0;
+  uint8_t transitionCount = 0;
+
+  uint16_t movingDistances[LD2410_FEATURE_WINDOW_SIZE];
+  uint16_t stationaryDistances[LD2410_FEATURE_WINDOW_SIZE];
+  uint16_t detectionDistances[LD2410_FEATURE_WINDOW_SIZE];
+
+  uint8_t movingEnergies[LD2410_FEATURE_WINDOW_SIZE];
+  uint8_t stationaryEnergies[LD2410_FEATURE_WINDOW_SIZE];
+
+  uint8_t movingDistanceCount = 0;
+  uint8_t stationaryDistanceCount = 0;
+  uint8_t detectionDistanceCount = 0;
+  uint8_t movingEnergyCount = 0;
+  uint8_t stationaryEnergyCount = 0;
+
+  uint8_t previousTarget = 255;
+
+  for (
+    uint8_t p = 0;
+    p < ld2410FeatureCount;
+    ++p
+  ) {
+    uint8_t index =
+      featureChronologicalIndex(p);
+
+    const Ld2410FeatureSample& s =
+      ld2410FeatureSamples[index];
+
+    if (s.moving) ++movingCount;
+    if (s.stationary) ++stationaryCount;
+
+    if (s.targetState == 2) ++target2Count;
+    if (s.targetState == 3) ++target3Count;
+
+    if (
+      previousTarget != 255 &&
+      s.targetState != previousTarget
+    ) {
+      ++transitionCount;
+    }
+
+    previousTarget = s.targetState;
+
+    if (s.movingDistanceCm > 0) {
+      movingDistances[movingDistanceCount++] =
+        s.movingDistanceCm;
+    }
+
+    if (s.stationaryDistanceCm > 0) {
+      stationaryDistances[stationaryDistanceCount++] =
+        s.stationaryDistanceCm;
+    }
+
+    if (s.detectionDistanceCm > 0) {
+      detectionDistances[detectionDistanceCount++] =
+        s.detectionDistanceCm;
+    }
+
+    movingEnergies[movingEnergyCount++] =
+      s.movingEnergy;
+
+    stationaryEnergies[stationaryEnergyCount++] =
+      s.stationaryEnergy;
+  }
+
+  uint16_t movingMedian =
+    medianUint16(
+      movingDistances,
+      movingDistanceCount
+    );
+
+  uint16_t stationaryMedian =
+    medianUint16(
+      stationaryDistances,
+      stationaryDistanceCount
+    );
+
+  uint16_t detectionMedian =
+    medianUint16(
+      detectionDistances,
+      detectionDistanceCount
+    );
+
+  // medianUint16 sorts in place, so rebuild the distance
+  // arrays before calculating IQR.
+  movingDistanceCount = 0;
+  stationaryDistanceCount = 0;
+
+  for (
+    uint8_t p = 0;
+    p < ld2410FeatureCount;
+    ++p
+  ) {
+    uint8_t index =
+      featureChronologicalIndex(p);
+
+    const Ld2410FeatureSample& s =
+      ld2410FeatureSamples[index];
+
+    if (s.movingDistanceCm > 0) {
+      movingDistances[movingDistanceCount++] =
+        s.movingDistanceCm;
+    }
+
+    if (s.stationaryDistanceCm > 0) {
+      stationaryDistances[stationaryDistanceCount++] =
+        s.stationaryDistanceCm;
+    }
+  }
+
+  uint16_t movingIqr =
+    iqrUint16(
+      movingDistances,
+      movingDistanceCount
+    );
+
+  uint16_t stationaryIqr =
+    iqrUint16(
+      stationaryDistances,
+      stationaryDistanceCount
+    );
+
+  uint8_t movingEnergyMedian =
+    medianUint8(
+      movingEnergies,
+      movingEnergyCount
+    );
+
+  uint8_t stationaryEnergyMedian =
+    medianUint8(
+      stationaryEnergies,
+      stationaryEnergyCount
+    );
+
+  uint8_t movingPct =
+    ((uint16_t)movingCount * 100U) /
+    ld2410FeatureCount;
+
+  uint8_t stationaryPct =
+    ((uint16_t)stationaryCount * 100U) /
+    ld2410FeatureCount;
+
+  uint8_t target2Pct =
+    ((uint16_t)target2Count * 100U) /
+    ld2410FeatureCount;
+
+  uint8_t target3Pct =
+    ((uint16_t)target3Count * 100U) /
+    ld2410FeatureCount;
+
+  updateLd2410AdaptiveBaseline(
+    movingPct,
+    stationaryPct,
+    target2Pct,
+    target3Pct,
+    transitionCount,
+    movingMedian,
+    movingIqr,
+    stationaryMedian,
+    stationaryIqr,
+    detectionMedian,
+    movingEnergyMedian,
+    stationaryEnergyMedian
+  );
+
+  Serial.printf(
+    "[MMWAVE FEATURES] "
+    "samples=%u "
+    "move=%u%% "
+    "stationary=%u%% "
+    "t2=%u%% "
+    "t3=%u%% "
+    "flips=%u "
+    "moveMed=%u "
+    "moveIQR=%u "
+    "staticMed=%u "
+    "staticIQR=%u "
+    "detectMed=%u "
+    "moveEnergyMed=%u "
+    "staticEnergyMed=%u "
+    "gpio21=%u\n",
+    ld2410FeatureCount,
+    movingPct,
+    stationaryPct,
+    target2Pct,
+    target3Pct,
+    transitionCount,
+    movingMedian,
+    movingIqr,
+    stationaryMedian,
+    stationaryIqr,
+    detectionMedian,
+    movingEnergyMedian,
+    stationaryEnergyMedian,
+    digitalRead(PRESENCE_PIN) ==
+      PRESENCE_ACTIVE_STATE ? 1 : 0
+  );
+}
+
+void serviceLd2410FeatureWindow() {
+  sampleLd2410FeatureWindow();
+  publishLd2410FeatureSerial();
+}
+
+
+bool publishLd2410HighResolutionBatch() {
+  if (!ld2410HighResolutionEnabled) {
+    // Disabling capture must never allow a partially collected
+    // development batch to publish later.
+    ld2410HighResolutionBatchCount = 0;
+    ld2410HighResolutionBatchStartedAt = 0;
+    return false;
+  }
+
+  if (ld2410HighResolutionBatchCount == 0) {
+    return false;
+  }
+
+  if (!mqtt.connected()) {
+    return false;
+  }
+
+  unsigned long now = millis();
+
+  if (
+    ld2410HighResolutionBatchCount <
+      LD2410_HIGH_RES_BATCH_CAPACITY &&
+    now - ld2410HighResolutionBatchStartedAt <
+      LD2410_HIGH_RES_BATCH_INTERVAL_MS
+  ) {
+    return false;
+  }
+
+  String p;
+  p.reserve(3800);
+
+  p += "{";
+  p += "\"protocolVersion\":\"2.0\",";
+  p += "\"eventType\":\"high_resolution_activity_evidence\",";
+  p += "\"evidenceSchemaVersion\":\"1.0\",";
+  p += "\"nodeId\":\"" + jsonEscape(nodeId) + "\",";
+  p += "\"locationName\":\"" + jsonEscape(locationName) + "\",";
+  p += "\"sourceKey\":\"" + jsonEscape(sourceKey) + "\",";
+  p += "\"residentName\":\"" + jsonEscape(residentName) + "\",";
+  p += "\"sensorMode\":\"human_presence\",";
+  p += "\"sensorType\":\"human_presence\",";
+  p += "\"source\":\"ld2410\",";
+  p += "\"observerOnly\":true,";
+  p += "\"developmentOnly\":true,";
+  p += "\"bootSessionId\":\"" +
+       jsonEscape(ld2410EvidenceBootSessionId) +
+       "\",";
+
+  ++ld2410HighResolutionBatchSequence;
+
+  p += "\"batchSequence\":" +
+       String(ld2410HighResolutionBatchSequence) +
+       ",";
+
+  p += "\"batchStartUptimeMs\":" +
+       String(ld2410HighResolutionBatchStartedAt) +
+       ",";
+
+  p += "\"batchEndUptimeMs\":" +
+       String(
+         ld2410HighResolutionBatch[
+           ld2410HighResolutionBatchCount - 1
+         ].uptimeMs
+       ) +
+       ",";
+
+  p += "\"sampleCount\":" +
+       String(ld2410HighResolutionBatchCount) +
+       ",";
+
+  p += "\"droppedSamplesTotal\":" +
+       String(ld2410HighResolutionDroppedSamples) +
+       ",";
+
+  // v2.4.3 compact observer transport.
+  //
+  // compact-array-v1 order:
+  // frameSequence, uptimeMs, targetState, radarPresence,
+  // movingTarget, movingDistanceCm, movingEnergy,
+  // stationaryTarget, stationaryDistanceCm, stationaryEnergy,
+  // detectionDistanceCm, stablePresenceState.
+  //
+  // Acquisition remains per parsed LD2410 frame. Transport remains
+  // approximately one MQTT event per second.
+  p += "\"sampleEncoding\":\"compact-array-v1\",";
+  p += "\"samples\":[";
+
+  for (
+    uint8_t i = 0;
+    i < ld2410HighResolutionBatchCount;
+    ++i
+  ) {
+    if (i > 0) {
+      p += ",";
+    }
+
+    const Ld2410HighResolutionSample& s =
+      ld2410HighResolutionBatch[i];
+
+    p += "[";
+    p += String(s.frameSequence);
+    p += ",";
+    p += String(s.uptimeMs);
+    p += ",";
+    p += String(s.targetState);
+    p += ",";
+    p += s.radarPresence ? "1" : "0";
+    p += ",";
+    p += s.movingTarget ? "1" : "0";
+    p += ",";
+    p += String(s.movingDistanceCm);
+    p += ",";
+    p += String(s.movingEnergy);
+    p += ",";
+    p += s.stationaryTarget ? "1" : "0";
+    p += ",";
+    p += String(s.stationaryDistanceCm);
+    p += ",";
+    p += String(s.stationaryEnergy);
+    p += ",";
+    p += String(s.detectionDistanceCm);
+    p += ",";
+    p += String((uint8_t)s.stablePresenceState);
+    p += "]";
+  }
+
+  p += "]";
+  p += "}";
+
+  bool ok =
+    mqtt.publish(
+      eventsTopic().c_str(),
+      p.c_str(),
+      false
+    );
+
+  if (!ok) {
+    return false;
+  }
+
+  mqtt.loop();
+
+  ld2410HighResolutionBatchCount = 0;
+  ld2410HighResolutionBatchStartedAt = 0;
+  ld2410HighResolutionLastPublishAt = now;
+
+  return true;
+}
+
+
+void serviceLd2410HighResolutionEvidence() {
+  publishLd2410HighResolutionBatch();
+}
+
+
+void serviceLd2410Uart() {
+  while (LD2410Serial.available()) {
+    uint8_t b = (uint8_t)LD2410Serial.read();
+
+    ld2410TotalBytesReceived++;
+
+    if (ld2410BufferCount < LD2410_BUFFER_SIZE) {
+      ld2410Buffer[ld2410BufferCount++] = b;
+    } else {
+      // Parser isolation: reset only the UART buffer.
+      // Never reset Wi-Fi/MQTT/BLE/device state.
+      ld2410BufferCount = 0;
+    }
+  }
+
+  processLd2410Buffer();
+
+  // Development-only observer transport is serviced only after
+  // all available UART bytes have been parsed. A failed publish
+  // leaves the current batch intact and never blocks parser state.
+  serviceLd2410HighResolutionEvidence();
+
+  serviceLd2410FeatureWindow();
+
+
+  serviceLd2410PresenceState();
+  serviceLd2410ProlongedStationary();
+  publishLd2410Diagnostic();
+}
+
+void servicePresence() {
+  int presence = digitalRead(PRESENCE_PIN);
+
+  accountLd2410OccupancySession(
+    presence == PRESENCE_ACTIVE_STATE
+  );
+
+  // TEMPORARY v2.3.0 DEVELOPMENT DIAGNOSTIC:
+  // Publish the raw GPIO21 electrical state whenever it changes.
+  static int diagnosticLastPresence = -1;
+  if (
+    GPIO21_RAW_DIAGNOSTIC_ENABLED &&
+    presence != diagnosticLastPresence &&
+    mqtt.connected()
+  ) {
+    diagnosticLastPresence = presence;
+    String diagnosticTopic =
+      "good-shepherd/v2/nodes/" + nodeId + "/diagnostics/gpio21";
+    mqtt.publish(
+      diagnosticTopic.c_str(),
+      presence == HIGH ? "1" : "0",
+      true
+    );
+  }
+
+  if (presence != lastPresenceState) {
+    lastPresenceState = presence;
+    logLine("LD2410 OUT=" + String(presence));
+  }
+
+  if (presence == PRESENCE_ACTIVE_STATE) {
+    noPresenceStartedAt = 0;
+    pendingPresenceCleared = false;
+
+    if (presenceHeldStartedAt == 0) {
+      presenceHeldStartedAt = millis();
+    } else if (presenceReported &&
+               millis() - presenceHeldStartedAt >=
+               PRESENCE_HELD_ACTIVE_REARM_MS) {
+      presenceReported = false;
+      presenceHeldStartedAt = millis();
+    }
+
+    if (!presenceReported) pendingPresenceDetected = true;
+
+    if (pendingPresenceDetected &&
+        (!lastPresenceAttemptAt ||
+         millis() - lastPresenceAttemptAt >= PRESENCE_EVENT_RETRY_MS)) {
+      lastPresenceAttemptAt = millis();
+      if (publishPresenceEvent(true)) {
+        pendingPresenceDetected = false;
+        presenceReported = true;
+      }
+    }
+    return;
+  }
+
+  presenceHeldStartedAt = 0;
+
+  if (!(presenceReported || pendingPresenceDetected ||
+        pendingPresenceCleared)) {
+    return;
+  }
+
+  if (noPresenceStartedAt == 0) noPresenceStartedAt = millis();
+  if (millis() - noPresenceStartedAt < PRESENCE_CLEAR_DELAY_MS) return;
+
+  pendingPresenceCleared = true;
+
+  if (pendingPresenceDetected) {
+    if (!lastPresenceAttemptAt ||
+        millis() - lastPresenceAttemptAt >= PRESENCE_EVENT_RETRY_MS) {
+      lastPresenceAttemptAt = millis();
+      if (publishPresenceEvent(true)) {
+        pendingPresenceDetected = false;
+        presenceReported = true;
+      }
+    }
+    return;
+  }
+
+  if (!lastPresenceAttemptAt ||
+      millis() - lastPresenceAttemptAt >= PRESENCE_EVENT_RETRY_MS) {
+    lastPresenceAttemptAt = millis();
+    if (publishPresenceEvent(false)) {
+      pendingPresenceCleared = false;
+      presenceReported = false;
+      noPresenceStartedAt = 0;
+    }
+  }
+}
+
+String bleStatusPayload() {
+  String p;
+  p.reserve(850);
+  p += "{";
+  p += "\"setupId\":\"" + jsonEscape(setupId) + "\",";
+  p += "\"nodeId\":\"" + jsonEscape(nodeId) + "\",";
+  p += "\"sourceKey\":\"" + jsonEscape(sourceKey) + "\",";
+  p += "\"sensorMode\":\"human_presence\",";
+  p += "\"deviceType\":\"human_presence\",";
+  p += "\"deviceName\":\"" + jsonEscape(deviceName) + "\",";
+  p += "\"locationName\":\"" + jsonEscape(locationName) + "\",";
+  p += "\"residentName\":\"" + jsonEscape(residentName) + "\",";
+  p += "\"roomName\":\"" + jsonEscape(roomName) + "\",";
+  p += "\"assignmentState\":\"" + assignmentState() + "\",";
+  p += "\"softwareVersion\":\"" + String(SOFTWARE_VERSION) + "\",";
+  p += "\"wifiConfigured\":" + String(wifiName.length() ? "true" : "false") + ",";
+  p += "\"wifiConnected\":" +
+       String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  p += "\"wifiSsid\":\"" +
+       jsonEscape(WiFi.status() == WL_CONNECTED ? WiFi.SSID() : wifiName) + "\",";
+  p += "\"localIp\":\"" +
+       String(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "") + "\",";
+  p += "\"mqttConnected\":" + String(mqtt.connected() ? "true" : "false") + ",";
+  p += "\"presence\":" +
+       String(digitalRead(PRESENCE_PIN) == PRESENCE_ACTIVE_STATE ? "true" : "false");
+  p += "}";
+  return p;
+}
+
+void updateBleStatus() {
+  if (!bleStatus) return;
+  String p = bleStatusPayload();
+  bleStatus->setValue(p.c_str());
+  if (bleClientConnected) bleStatus->notify();
+  lastBleStatusAt = millis();
+}
+
+void publishBleResult(const String& status, const String& message) {
+  if (!bleResult) return;
+  String p = "{\"status\":\"" + jsonEscape(status) +
+             "\",\"message\":\"" + jsonEscape(message) + "\"}";
+  bleResult->setValue(p.c_str());
+  if (bleClientConnected) bleResult->notify();
+}
+
+void startOperationalWifi() {
+  if (wifiName.length() == 0 || wifiPassword.length() == 0) return;
+  if (wifiConnectInProgress) return;
+
+  wifiConnectInProgress = true;
+  lastWifiAttemptAt = millis();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(wifiName.c_str(), wifiPassword.c_str());
+  logLine("Starting saved Wi-Fi connection to " + wifiName);
+}
+
+void serviceWifi() {
+  if (bleBootWindowActive) return;
+  if (wifiName.length() == 0 || wifiPassword.length() == 0) return;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (wifiConnectInProgress || wifiConnectedAt == 0) {
+      wifiConnectInProgress = false;
+      wifiConnectedAt = millis();
+      logLine("Wi-Fi connected. IP=" + WiFi.localIP().toString());
+    }
+    return;
+  }
+
+  wifiConnectedAt = 0;
+  wifiConnectInProgress = false;
+
+  if (!lastWifiAttemptAt ||
+      millis() - lastWifiAttemptAt >= WIFI_RECONNECT_INTERVAL_MS) {
+    startOperationalWifi();
+  }
+}
+
+void applyBleConfig(const String& payload) {
+  String ssid = extractJsonString(payload, "ssid");
+  String password = extractJsonString(payload, "password");
+
+  if (ssid.length() == 0) {
+    publishBleResult("failed", "SSID required");
+    return;
+  }
+
+  String requestedMode = extractJsonString(payload, "sensorMode");
+  if (requestedMode.length() == 0)
+    requestedMode = extractJsonString(payload, "deviceType");
+
+  requestedMode.trim();
+  requestedMode.toLowerCase();
+
+  if (requestedMode.length() &&
+      !isHumanPresenceMode(requestedMode)) {
+    publishBleResult("failed", "human_presence only");
+    return;
+  }
+
+  wifiName = ssid;
+  wifiPassword = password;
+
+  String v = extractJsonString(payload, "locationName");
+  if (v.length()) locationName = v;
+
+  v = extractJsonString(payload, "residentName");
+  if (v.length()) residentName = v;
+
+  v = extractJsonString(payload, "roomName");
+  if (v.length()) roomName = v;
+
+  v = extractJsonString(payload, "deviceName");
+  if (v.length()) deviceName = v;
+  if (deviceName.length() == 0) deviceName = "Human Presence Sensor";
+
+  saveSettings();
+  publishBleResult("success", "saved");
+  updateBleStatus();
+
+  bleBootWindowActive = false;
+  delay(250);
+  startOperationalWifi();
+
+  if (extractJsonBool(payload, "restartAfterSave", false)) {
+    delay(750);
+    ESP.restart();
+  }
+}
+
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
+    bleClientConnected = true;
+    bleConnectedAt = millis();
+    updateBleStatus();
+  }
+
+  void onDisconnect(
+    NimBLEServer* pServer,
+    NimBLEConnInfo& connInfo,
+    int reason
+  ) override {
+    bleClientConnected = false;
+    bleConnectedAt = 0;
+
+    if (!bleReleasedForRuntime) {
+      NimBLEDevice::startAdvertising();
+      if (bleBootWindowActive &&
+          wifiName.length() && wifiPassword.length()) {
+        bleBootWindowStartedAt = millis();
+      }
+    }
+  }
+};
+
+class CommandCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(
+    NimBLECharacteristic* characteristic,
+    NimBLEConnInfo& connInfo
+  ) override {
+    if (pendingBleCommand) return;
+    std::string value = characteristic->getValue();
+    if (value.empty()) return;
+
+    pendingBleCommandPayload = String(value.c_str());
+    pendingBleCommand = true;
+  }
+};
+
+void startBle() {
+  if (bleStarted) return;
+
+  String bleName = "GoodShepherd-" + setupId;
+  NimBLEDevice::init(bleName.c_str());
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+  bleServer = NimBLEDevice::createServer();
+  bleServer->setCallbacks(new ServerCallbacks());
+
+  NimBLEService* service = bleServer->createService(BLE_SERVICE_UUID);
+
+  bleStatus = service->createCharacteristic(
+    BLE_STATUS_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+  );
+
+  bleCommand = service->createCharacteristic(
+    BLE_COMMAND_UUID,
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+  );
+  bleCommand->setCallbacks(new CommandCallbacks());
+
+  bleResult = service->createCharacteristic(
+    BLE_RESULT_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+  );
+
+  service->start();
+
+  NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
+  advertising->addServiceUUID(BLE_SERVICE_UUID);
+  advertising->enableScanResponse(true);
+
+  updateBleStatus();
+  NimBLEDevice::startAdvertising();
+
+  bleStarted = true;
+  bleReleasedForRuntime = false;
+  logLine("NimBLE management started as " + bleName);
+}
+
+void stopBleForRuntime() {
+  if (!bleStarted || bleReleasedForRuntime) return;
+  if (bleClientConnected) return;
+
+  logLine("Releasing NimBLE for MQTT runtime.");
+  NimBLEDevice::stopAdvertising();
+  NimBLEDevice::deinit(true);
+
+  bleServer = nullptr;
+  bleStatus = nullptr;
+  bleCommand = nullptr;
+  bleResult = nullptr;
+
+  bleStarted = false;
+  bleReleasedForRuntime = true;
+}
+
+void serviceBleBootWindow() {
+  if (!bleBootWindowActive) return;
+  if (bleClientConnected) return;
+
+  if (wifiName.length() == 0 || wifiPassword.length() == 0) return;
+
+  if (bleBootWindowStartedAt == 0)
+    bleBootWindowStartedAt = millis();
+
+  if (millis() - bleBootWindowStartedAt < BLE_BOOT_SETUP_WINDOW_MS)
+    return;
+
+  bleBootWindowActive = false;
+  logLine("BLE startup window expired; entering runtime.");
+  startOperationalWifi();
+}
+
+void serviceBle() {
+  if (!bleStarted) return;
+
+  if (bleClientConnected &&
+      bleConnectedAt &&
+      millis() - bleConnectedAt >= BLE_MAX_CONNECTED_SESSION_MS) {
+    bleServer->disconnect(0);
+    return;
+  }
+
+  if (bleClientConnected &&
+      (!lastBleStatusAt ||
+       millis() - lastBleStatusAt >= BLE_STATUS_INTERVAL_MS)) {
+    updateBleStatus();
+  }
+}
+
+bool inventoryAlreadyRegistered() {
+  prefs.begin("gs-device", true);
+  bool done = prefs.getBool(FACTORY_REGISTRATION_MARKER_KEY, false);
+  prefs.end();
+  return done;
+}
+
+void markInventoryRegistered() {
+  prefs.begin("gs-device", false);
+  prefs.putBool(FACTORY_REGISTRATION_MARKER_KEY, true);
+  prefs.end();
+}
+
+bool postRegistration() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(10000);
+  http.setReuse(false);
+
+  if (!http.begin(client, REGISTER_URL)) return false;
+  http.addHeader("Content-Type", "application/json");
+
+  String p;
+  p.reserve(650);
+  p += "{";
+  p += "\"nodeId\":\"" + jsonEscape(nodeId) + "\",";
+  p += "\"sourceKey\":\"" + jsonEscape(sourceKey) + "\",";
+  p += "\"setupId\":\"" + jsonEscape(setupId) + "\",";
+  p += "\"deviceName\":\"" + jsonEscape(deviceName) + "\",";
+  p += "\"locationName\":\"" + jsonEscape(locationName) + "\",";
+  p += "\"residentName\":\"" + jsonEscape(residentName) + "\",";
+  p += "\"roomName\":\"" + jsonEscape(roomName) + "\",";
+  p += "\"sensorMode\":\"human_presence\",";
+  p += "\"softwareVersion\":\"" + String(SOFTWARE_VERSION) + "\"";
+  p += "}";
+
+  int code = http.POST(p);
+  http.end();
+  client.stop();
+
+  return code >= 200 && code < 300;
+}
+
+void runFactoryInventoryBootstrap() {
+  if (inventoryAlreadyRegistered()) return;
+  if (strlen(FACTORY_WIFI_SSID) == 0 ||
+      strlen(FACTORY_WIFI_PASSWORD) == 0) return;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(FACTORY_WIFI_SSID, FACTORY_WIFI_PASSWORD);
+
+  unsigned long started = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - started < FACTORY_WIFI_TIMEOUT_MS) {
+    delay(100);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (postRegistration()) markInventoryRegistered();
+  }
+
+  WiFi.disconnect(true, false);
+  delay(150);
+}
+
+
+void stopBleForOta() {
+  if (!bleStarted) return;
+
+  NimBLEDevice::stopAdvertising();
+  NimBLEDevice::deinit(true);
+
+  bleServer = nullptr;
+  bleStatus = nullptr;
+  bleCommand = nullptr;
+  bleResult = nullptr;
+  bleStarted = false;
+  bleClientConnected = false;
+  bleReleasedForRuntime = true;
+
+  delay(250);
+}
+
+void performFirmwareUpdate(
+  const String& commandId,
+  const String& commandType,
+  const String& firmwareUrl
+) {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (commandId.length()) {
+      publishCommandResult(
+        commandId, commandType, "failed",
+        "wifi offline"
+      );
+    }
+    return;
+  }
+
+  if (mqtt.connected()) {
+    if (commandId.length()) {
+      publishCommandResult(
+        commandId, commandType, "running",
+        "downloading"
+      );
+    }
+    mqtt.loop();
+    delay(150);
+    mqtt.disconnect();
+  }
+
+  mqttTls.stop();
+  stopBleForOta();
+
+  // Restore the proven OTA radio transition before opening HTTPS.
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  delay(750);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(120000);
+
+  HTTPClient http;
+  http.setTimeout(180000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setReuse(false);
+  http.setUserAgent("GoodShepherd-ESP32-OTA/1.9.5");
+
+  if (!http.begin(client, firmwareUrl)) {
+    logLine("OTA failed: could not open URL.");
+    ESP.restart();
+    return;
+  }
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    logLine(String(code));
+    http.end();
+    client.stop();
+    ESP.restart();
+    return;
+  }
+
+  int contentLength = http.getSize();
+  if (contentLength == 0) {
+    logLine("OTA failed: empty firmware.");
+    http.end();
+    client.stop();
+    ESP.restart();
+    return;
+  }
+
+  if (!Update.begin(contentLength > 0
+      ? (size_t)contentLength
+      : UPDATE_SIZE_UNKNOWN)) {
+    logLine("OTA failed: Update.begin error=" + String(Update.getError()));
+    http.end();
+    client.stop();
+    ESP.restart();
+    return;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  size_t written = Update.writeStream(*stream);
+
+  if (contentLength > 0 &&
+      written != (size_t)contentLength) {
+    Update.abort();
+    logLine("OTA failed: incomplete write.");
+    http.end();
+    client.stop();
+    ESP.restart();
+    return;
+  }
+
+  bool ended = Update.end();
+  bool finished = Update.isFinished();
+
+  http.end();
+  client.stop();
+
+  if (!ended || !finished) {
+    logLine("OTA finalization failed error=" + String(Update.getError()));
+    ESP.restart();
+    return;
+  }
+
+  logLine("OTA installed successfully; rebooting.");
+  delay(1000);
+  ESP.restart();
+}
+
+void executeMqttCommand(const String& payload) {
+  String commandId = extractJsonString(payload, "commandId");
+  String commandType = extractJsonString(payload, "commandType");
+  commandType.trim();
+  commandType.toLowerCase();
+
+  if (commandId.length() == 0 || commandType.length() == 0) return;
+
+  publishCommandResult(
+    commandId, commandType, "running",
+    "running"
+  );
+
+  if (commandType == "ping") {
+    publishCommandResult(
+      commandId, commandType, "success",
+      "pong"
+    );
+    return;
+  }
+
+  if (commandType == "identify" || commandType == "locate") {
+    blinkIdentify();
+    publishCommandResult(
+      commandId, commandType, "success",
+      "identified"
+    );
+    return;
+  }
+
+  if (commandType == "reboot") {
+    publishCommandResult(
+      commandId, commandType, "success",
+      "restarting"
+    );
+    mqtt.loop();
+    delay(500);
+    ESP.restart();
+    return;
+  }
+
+  if (commandType == "reconfigure") {
+    publishCommandResult(
+      commandId, commandType, "success",
+      "reconfiguring"
+    );
+    mqtt.loop();
+    delay(300);
+    clearAssignmentSettingsOnly();
+    ESP.restart();
+    return;
+  }
+
+  if (commandType == "factory_reset") {
+    publishCommandResult(
+      commandId, commandType, "success",
+      "resetting"
+    );
+    mqtt.loop();
+    delay(300);
+    factoryClearEverything();
+    ESP.restart();
+    return;
+  }
+
+  if (commandType == "high_res_enable") {
+    ld2410HighResolutionEnabled = true;
+    ld2410HighResolutionBatchCount = 0;
+    ld2410HighResolutionBatchStartedAt = 0;
+
+    publishCommandResult(
+      commandId, commandType, "success",
+      "High-resolution activity evidence enabled."
+    );
+    return;
+  }
+
+  if (commandType == "high_res_disable") {
+    ld2410HighResolutionEnabled = false;
+    ld2410HighResolutionBatchCount = 0;
+    ld2410HighResolutionBatchStartedAt = 0;
+
+    publishCommandResult(
+      commandId, commandType, "success",
+      "High-resolution activity evidence disabled."
+    );
+    return;
+  }
+
+  if (commandType == "update_firmware") {
+    String url = extractJsonString(payload, "firmwareUrl");
+    if (url.length() == 0) {
+      publishCommandResult(
+        commandId, commandType, "failed",
+        "missing firmwareUrl"
+      );
+      return;
+    }
+    performFirmwareUpdate(commandId, commandType, url);
+    return;
+  }
+
+  publishCommandResult(
+    commandId, commandType, "failed",
+    "unsupported"
+  );
+}
+
+void executeBleCommand(const String& payload) {
+  String command = extractJsonString(payload, "command");
+  if (command.length() == 0)
+    command = extractJsonString(payload, "action");
+  command.trim();
+  command.toLowerCase();
+
+  if (command.length() == 0) {
+    publishBleResult("failed", "missing command");
+    return;
+  }
+
+  if (command == "get_status" || command == "status") {
+    updateBleStatus();
+    publishBleResult("success", "ok");
+    return;
+  }
+
+  if (command == "identify" || command == "locate") {
+    publishBleResult("running", "running");
+    blinkIdentify();
+    publishBleResult("success", "identified");
+    return;
+  }
+
+  if (command == "set_wifi" ||
+      command == "sync_wifi" ||
+      command == "sync_config") {
+    applyBleConfig(payload);
+    return;
+  }
+
+  if (command == "set_sensor_mode") {
+    String mode = extractJsonString(payload, "sensorMode");
+    mode.trim();
+    mode.toLowerCase();
+
+    if (mode.length() &&
+        !isHumanPresenceMode(mode)) {
+      publishBleResult(
+        "failed",
+        "human_presence only"
+      );
+      return;
+    }
+
+    String newName = extractJsonString(payload, "deviceName");
+    if (newName.length()) deviceName = newName;
+    saveSettings();
+
+    publishBleResult(
+      "success",
+      "saved"
+    );
+    updateBleStatus();
+    return;
+  }
+
+  if (command == "check_firmware") {
+    publishBleResult(
+      "success",
+      String(SOFTWARE_VERSION)
+    );
+    return;
+  }
+
+  if (command == "force_update" ||
+      command == "update_firmware") {
+    String url = extractJsonString(payload, "firmwareUrl");
+    if (url.length() == 0) {
+      publishBleResult(
+        "failed",
+        "missing firmwareUrl"
+      );
+      return;
+    }
+
+    publishBleResult("running", "updating");
+    delay(250);
+    performFirmwareUpdate("", "update_firmware", url);
+    return;
+  }
+
+  if (command == "restart" || command == "reboot") {
+    publishBleResult("success", "restarting");
+    delay(500);
+    ESP.restart();
+    return;
+  }
+
+  if (command == "reconfigure") {
+    publishBleResult(
+      "success",
+      "reconfiguring"
+    );
+    delay(300);
+    clearAssignmentSettingsOnly();
+    ESP.restart();
+    return;
+  }
+
+  if (command == "factory_reset") {
+    publishBleResult("success", "resetting");
+    delay(300);
+    factoryClearEverything();
+    ESP.restart();
+    return;
+  }
+
+  if (command == "ping") {
+    publishBleResult("success", "pong");
+    return;
+  }
+
+  publishBleResult("failed", "unknown command");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(PRESENCE_PIN, INPUT_PULLDOWN);
+
+  LD2410Serial.begin(
+    LD2410_UART_BAUD,
+    SERIAL_8N1,
+    LD2410_RX_PIN,
+    LD2410_TX_PIN
+  );
+  pinMode(LED_PIN, OUTPUT);
+  setLed(false);
+
+  ensureIdentity();
+
+  char evidenceBootSessionBuf[17];
+  snprintf(
+    evidenceBootSessionBuf,
+    sizeof(evidenceBootSessionBuf),
+    "%08lx%08lx",
+    (unsigned long)esp_random(),
+    (unsigned long)esp_random()
+  );
+  ld2410EvidenceBootSessionId = String(evidenceBootSessionBuf);
+
+  loadSettings();
+
+
+  runFactoryInventoryBootstrap();
+  startBle();
+
+  bleBootWindowActive = true;
+
+  if (wifiName.length() && wifiPassword.length()) {
+    bleBootWindowStartedAt = millis();
+    logLine("BLE setup window active for 60 seconds.");
+  } else {
+    bleBootWindowStartedAt = 0;
+    logLine("No saved operational Wi-Fi; BLE remains available.");
+  }
+}
+
+void loop() {
+  if (pendingBleCommand) {
+    String payload = pendingBleCommandPayload;
+    pendingBleCommandPayload = "";
+    pendingBleCommand = false;
+    executeBleCommand(payload);
+  }
+
+  serviceBleBootWindow();
+  serviceBle();
+
+  if (!bleBootWindowActive) {
+    serviceWifi();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!bleClientConnected &&
+          bleStarted &&
+          wifiConnectedAt &&
+          millis() - wifiConnectedAt > 3000UL) {
+        stopBleForRuntime();
+      }
+
+      serviceMqtt();
+
+      if (pendingMqttCommand) {
+        String payload = pendingMqttCommandPayload;
+        pendingMqttCommandPayload = "";
+        pendingMqttCommand = false;
+        executeMqttCommand(payload);
+      }
+
+      if (mqtt.connected()) {
+        servicePresence();
+  serviceLd2410Uart();
+      }
+    }
+  }
+
+  delay(10);
+}
