@@ -7579,6 +7579,20 @@ bool publishLd2410HighResolutionBatch() {
        jsonEscape(ld2410EvidenceBootSessionId) +
        "\",";
 
+  // Timed-capture provenance for controlled ground-truth analysis.
+  // Development-only metadata; does not change sensor or capture behavior.
+  if (ld2410TimedCaptureActive) {
+    p += "\"captureCommandId\":\"" +
+         jsonEscape(ld2410TimedCaptureCommandId) +
+         "\",";
+    p += "\"captureMode\":\"" +
+         jsonEscape(ld2410TimedCaptureMode) +
+         "\",";
+    p += "\"captureReason\":\"" +
+         jsonEscape(ld2410TimedCaptureReason) +
+         "\",";
+  }
+
   ++ld2410HighResolutionBatchSequence;
 
   p += "\"batchSequence\":" +
