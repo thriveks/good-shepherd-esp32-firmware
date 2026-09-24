@@ -484,17 +484,23 @@ void saveSettings() {
 }
 
 void clearAssignmentSettingsOnly() {
+  // Recommissioning intentionally preserves the physical sensor identity,
+  // current firmware, sensor type/name, setup ID, and saved Wi-Fi.
+  // Only the resident-specific assignment is removed.
   prefs.begin("gs-device", false);
-  prefs.remove("wifiName");
-  prefs.remove("wifiPass");
   prefs.remove("location");
   prefs.remove("resident");
   prefs.remove("room");
-  prefs.remove("deviceName");
-  prefs.remove("sensorMode");
-  prefs.remove("nodeId");
-  prefs.remove("sourceKey");
   prefs.end();
+
+  locationName = "";
+  residentName = "";
+  roomName = "";
+
+  Serial.println(
+    "Assignment cleared. Wi-Fi, setup ID, device identity, "
+    "device name, and sensor mode preserved."
+  );
 }
 
 void factoryClearEverything() {
@@ -8092,6 +8098,14 @@ void stopBleForRuntime() {
 
 void serviceBleBootWindow() {
   if (!bleBootWindowActive) return;
+
+  // An unassigned sensor is deliberately held in BLE commissioning mode.
+  // Saved Wi-Fi remains available for the next assignment, but runtime must
+  // not resume until BLE setup commits a resident/location/room.
+  if (assignmentState() == "Unassigned") {
+    bleBootWindowStartedAt = 0;
+    return;
+  }
   if (bleClientConnected) return;
 
   if (wifiName.length() == 0 || wifiPassword.length() == 0) return;
