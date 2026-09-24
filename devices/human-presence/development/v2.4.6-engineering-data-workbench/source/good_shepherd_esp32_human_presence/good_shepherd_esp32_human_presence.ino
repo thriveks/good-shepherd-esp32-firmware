@@ -58,7 +58,7 @@ static constexpr bool GPIO21_RAW_DIAGNOSTIC_ENABLED = false;
 static constexpr bool PRESENCE_STATE_DIAGNOSTIC_ENABLED = true;
 
 static const char* SOFTWARE_VERSION =
-  "esp32-good-shepherd-human-presence-v2.4.7-adaptive-capture-v1";
+  "esp32-good-shepherd-human-presence-v2.4.8-recommission-v1";
 
 HardwareSerial LD2410Serial(2);
 
