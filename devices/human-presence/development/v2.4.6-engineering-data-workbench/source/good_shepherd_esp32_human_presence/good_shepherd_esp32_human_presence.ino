@@ -58,7 +58,7 @@ static constexpr bool GPIO21_RAW_DIAGNOSTIC_ENABLED = false;
 static constexpr bool PRESENCE_STATE_DIAGNOSTIC_ENABLED = true;
 
 static const char* SOFTWARE_VERSION =
-  "esp32-good-shepherd-human-presence-v2.4.8-recommission-v1";
+  "esp32-good-shepherd-human-presence-v2.4.9-canonical-name-v1";
 
 HardwareSerial LD2410Serial(2);
 
@@ -463,13 +463,26 @@ void loadSettings() {
   locationName = prefs.getString("location", "");
   residentName = prefs.getString("resident", "");
   roomName = prefs.getString("room", "");
-  deviceName = prefs.getString("deviceName", "Human Presence Sensor");
+  String storedDeviceName =
+    prefs.getString("deviceName", "Human Presence Sensor");
   prefs.end();
 
-  if (deviceName.length() == 0) deviceName = "Human Presence Sensor";
+  // This is dedicated Human Presence firmware. Device family is firmware
+  // identity, not user data, so stale NVS from a prior Motion image must never
+  // leak back into BLE or MQTT status after recommissioning.
+  deviceName = "Human Presence Sensor";
+
+  if (storedDeviceName != deviceName) {
+    prefs.begin("gs-device", false);
+    prefs.putString("deviceName", deviceName);
+    prefs.putString("sensorMode", "human_presence");
+    prefs.end();
+  }
 }
 
 void saveSettings() {
+  deviceName = "Human Presence Sensor";
+
   prefs.begin("gs-device", false);
   prefs.putString("wifiName", wifiName);
   prefs.putString("wifiPass", wifiPassword);
@@ -7980,9 +7993,9 @@ void applyBleConfig(const String& payload) {
   v = extractJsonString(payload, "roomName");
   if (v.length()) roomName = v;
 
-  v = extractJsonString(payload, "deviceName");
-  if (v.length()) deviceName = v;
-  if (deviceName.length() == 0) deviceName = "Human Presence Sensor";
+  // Ignore stale/cross-family labels from clients. Dedicated Human Presence
+  // firmware owns its product identity.
+  deviceName = "Human Presence Sensor";
 
   saveSettings();
   publishBleResult("success", "saved");
@@ -8570,8 +8583,7 @@ void executeBleCommand(const String& payload) {
       return;
     }
 
-    String newName = extractJsonString(payload, "deviceName");
-    if (newName.length()) deviceName = newName;
+    deviceName = "Human Presence Sensor";
     saveSettings();
 
     publishBleResult(
