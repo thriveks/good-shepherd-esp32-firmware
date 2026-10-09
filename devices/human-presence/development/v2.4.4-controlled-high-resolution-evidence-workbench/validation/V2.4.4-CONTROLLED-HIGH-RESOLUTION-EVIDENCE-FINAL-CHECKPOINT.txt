@@ -1,0 +1,200 @@
+GOOD SHEPHERD HUMAN PRESENCE
+v2.4.4 CONTROLLED HIGH-RESOLUTION EVIDENCE
+FINAL VALIDATED CHECKPOINT
+
+Status:
+VALIDATED / FROZEN
+
+Purpose:
+Preserve the validated human-presence mmWave firmware state that adds an
+observer-only high-resolution LD2410 evidence channel with remote runtime
+enable/disable control while preserving normal human-presence operation.
+
+FIRMWARE SOURCE
+
+Version:
+esp32-good-shepherd-human-presence-v2.4.4-controlled-high-resolution-evidence
+
+Source SHA-256:
+2458762f4f68791d5306ea22e493cb984ea0ab6e820b4efdbaa91bfa56ea0635
+
+Sketch partitions.csv SHA-256:
+38a00264bb4ba39e0bbcabbf4ea9e52edbf66c5d27ef8e30ea7c30afed041d71
+
+Validated compiled application SHA-256:
+1e10e4e255a2fab61bc3ce458284f0d87547b57665f62dfedac0376a7d1d534e
+
+Validated bootloader SHA-256:
+427f96e10c620c4f062dab15da54fc45494d897e8397ae6f3aecc98c42d7e379
+
+Validated compiled partition binary SHA-256:
+0a8b5720e7b77ff11f1462458c3a509dee79224e5279898f26d6a2e3ae0517b7
+
+Validated boot_app0 SHA-256:
+f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0
+
+BUILD CONTRACT
+
+Arduino FQBN:
+esp32:esp32:esp32:PartitionScheme=custom
+
+ESP32 core:
+3.3.11
+
+Validated segmented flash layout:
+0x1000  bootloader
+0x8000  partitions
+0xe000  boot_app0
+0x10000 application
+
+Do not flash the merged 4 MB image at 0x0.
+
+HIGH-RESOLUTION EVIDENCE BEHAVIOR
+
+Local LD2410 acquisition remains approximately 10 samples/second.
+
+Transport batches approximately once per second.
+
+Compact sample order:
+0  frameSequence
+1  uptimeMs
+2  targetState
+3  radarPresence
+4  movingTarget
+5  movingDistanceCm
+6  movingEnergy
+7  stationaryTarget
+8  stationaryDistanceCm
+9  stationaryEnergy
+10 detectionDistanceCm
+11 stablePresenceState
+
+The high-resolution evidence path is observer-only and development-only.
+
+RUNTIME CONTROL
+
+Boot default:
+OFF
+
+Runtime enable command:
+high_res_enable
+
+Runtime disable command:
+high_res_disable
+
+The setting is not persisted in Preferences.
+
+A reboot therefore returns high-resolution evidence to OFF.
+
+Disabling clears any pending high-resolution batch.
+
+NORMAL HUMAN-PRESENCE PATH PRESERVATION
+
+Normal LD2410 parser behavior:
+UNCHANGED
+
+GPIO21 presence authority:
+UNCHANGED
+
+Baseline behavior:
+UNCHANGED
+
+Candidate behavior:
+UNCHANGED
+
+Episode behavior:
+UNCHANGED
+
+OTA transport:
+UNCHANGED
+
+BLE behavior:
+UNCHANGED
+
+VALIDATION RESULTS
+
+Source static validation:
+PASS
+
+Compile:
+PASS
+
+Custom partition layout:
+PASS
+
+Segmented flash to Sensor9 esp32-a02dbcabc31c:
+PASS
+
+NVS preserved:
+YES
+
+Boot default OFF:
+PASS
+
+Normal mmWave operation with high-resolution evidence OFF:
+PASS
+
+Remote high_res_enable command:
+PASS
+
+High-resolution stream after enable:
+PASS
+
+Remote high_res_disable command:
+PASS
+
+High-resolution stream stopped after disable:
+PASS
+
+Normal mmWave traffic remained operational:
+PASS
+
+Server runtime lifecycle integration:
+PASS
+
+Production server command history visibility:
+PASS
+
+Server production commit:
+7530ed72638dd42183221418b97585575b86cbd7
+
+Render production deploy:
+dep-daha0f142hec73fefvbg
+
+ANALYTICAL BOUNDARIES
+
+High-resolution evidence is not an operational alert channel.
+
+No fall detection has been established.
+
+No fall or emergency inference is authorized by this checkpoint.
+
+No activity classification thresholds are established by this checkpoint.
+
+Normalized moving-distance temporal shape is supported as an analytical
+signal, but distance-only classification is not supported.
+
+Moving energy was evaluated as a secondary signal and rejected from the
+v1 combined normalized signature because it reduced separation.
+
+movingTarget temporal shape was rejected as an activity classifier.
+
+stationaryEnergy was saturated in the tested recordings and rejected as
+a useful temporal feature for the current evidence set.
+
+radarPresence and stationaryTarget were saturated and rejected as
+discriminative activity features in the current evidence set.
+
+FINAL GATE
+
+V2_4_4_SOURCE=PASS
+COMPILE=PASS
+FLASH=PASS
+HIGH_RES_BOOT_DEFAULT_OFF=PASS
+RUNTIME_ENABLE=PASS
+RUNTIME_DISABLE=PASS
+NORMAL_MMWAVE_PATH=PRESERVED
+FALL_DETECTION=NOT_ESTABLISHED
+CLASSIFICATION_THRESHOLDS=NONE
+FIRMWARE_STATE=FROZEN
+REFLASH=NO

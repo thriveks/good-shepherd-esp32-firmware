@@ -34,3 +34,18 @@ These local files must be inspected, secret-scanned, and checked against each re
 Make the repository private using GitHub repository administration **before** importing production sources. Preserve the released binaries, their tags and digests for rollback. Do not overwrite immutable releases or push OTA updates merely to repair Git source bookkeeping.
 
 Last verified from the production database and GitHub releases: 2026-10-08. This document is release metadata, **not** source parity certification.
+
+## Canonical firmware tree (GitHub main)
+
+- `devices/motion/development/`: editable PIR workbenches; **not** automatically production source.
+- `devices/human-presence/development/`: editable LD2410 workbenches; **not** automatically production source.
+- `devices/{motion,human-presence}/testing/`: isolated firmware candidate evaluation (do not publish directly to OTA).
+- `production/{motion,human-presence}/CURRENT`: canonical GitHub references for today's OTA versions.
+- `production/{motion,human-presence}/<version>/RELEASE.json`: GitHub release asset tag, filename, checksum and the **unverified** source-parity state.
+- `production/manifest.json`: production release registry checked by `node tools/verify-production-manifests.mjs`.
+- `releases/`: documentation and metadata; compiled OTA binaries continue to live in GitHub Releases.
+- `archive/`: historical rollback references. The root `good_shepherd_esp32_motion/` sketch remains a v1.9.5 legacy copy; never treat it as live production source.
+
+**Release rule:** Development → isolated testing → record test evidence → archive exact source, build settings and flash images → verify binary SHA-256 matches the immutable GitHub Release asset → update production manifest/CURRENT after controlled promotion. Updating GitHub source files or manifests alone does **not** change device OTA versions. The production server's active release records control OTA selection.
+
+**Outstanding:** inspect the protected manufacturer folders `Desktop/production/motion/CURRENT` and `Desktop/production/human-presence/CURRENT`, confirm source/build provenance, and match local flash artifacts to the OTA asset checksums before marking source parity VERIFIED. Do not relabel workbench source as binary provenance.

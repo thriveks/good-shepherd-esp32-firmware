@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "sourceOfTruth": "GitHub release assets for OTA bytes; versioned release records in production server select active version; source parity not yet verified",
+  "families": {
+    "motion": "production/motion/esp32-good-shepherd-motion-v2.1.0-commissioning-v2/RELEASE.json",
+    "human-presence": "production/human-presence/esp32-good-shepherd-human-presence-v2.4.8-recommission-v1/RELEASE.json"
+  }
+}

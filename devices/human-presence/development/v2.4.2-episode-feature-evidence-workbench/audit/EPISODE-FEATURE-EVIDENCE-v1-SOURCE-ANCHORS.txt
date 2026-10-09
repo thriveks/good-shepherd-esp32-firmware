@@ -1,0 +1,220 @@
+285:void blinkIdentify(unsigned long durationMs = 12000UL) {
+288:  while (millis() - started < durationMs) {
+803:    // CLEAR and unknown time remain part of total occupancy duration
+1081:  payload += ",\"movingDistanceCm\":";
+1084:  payload += ",\"movingEnergy\":";
+1090:  payload += ",\"stationaryDistanceCm\":";
+1093:  payload += ",\"stationaryEnergy\":";
+1766:  uint16_t movingDistanceCm;
+1767:  uint8_t movingEnergy;
+1768:  uint16_t stationaryDistanceCm;
+1769:  uint8_t stationaryEnergy;
+1894:  sample.movingDistanceCm =
+1897:  sample.movingEnergy =
+1900:  sample.stationaryDistanceCm =
+1903:  sample.stationaryEnergy =
+2031:// A separate RAM-only candidate profile learns only while the
+2485:  unsigned long durationMs =
+2508:    "durationMs=%lu "
+2518:    (unsigned long)durationMs,
+2884:  uint8_t movingEnergyMedian,
+2885:  uint8_t stationaryEnergyMedian
+2950:    movingEnergyMedian
+2956:    stationaryEnergyMedian
+3008:// The final candidate profile from one completed persistent
+3039://   quarantined candidate profile
+3132:bool ld2410CandidateEvidenceValid = false;
+3208:  uint8_t movingEnergyMedian,
+3209:  uint8_t stationaryEnergyMedian
+3254:    (float)movingEnergyMedian;
+3257:    (float)stationaryEnergyMedian;
+3381:// Capture the final quarantined candidate profile when a
+3422:// Compare the current candidate profile to the immediately
+3423:// preceding held candidate profile.
+3757:  ld2410CandidateEvidenceHistoryStabilitySamples[
+3762:  ld2410CandidateEvidenceHistoryStabilityDelta[
+3767:  ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+3772:  ld2410CandidateEvidenceHistoryRecurrenceSamples[
+3777:  ld2410CandidateEvidenceHistoryRecurrenceDelta[
+3782:  ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+3787:  ld2410CandidateEvidenceHistorySeparationSamples[
+3792:  ld2410CandidateEvidenceHistorySeparationDelta[
+3797:  ld2410CandidateEvidenceHistorySeparationMeanDelta[
+3802:  ld2410CandidateEvidenceHistoryTrajectorySamples[
+3807:  ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+3812:  ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+3817:  ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+3822:  ld2410CandidateEvidenceHistoryTrajectoryDrift[
+3923:        ld2410CandidateEvidenceHistoryStabilityDelta[
+3926:        ld2410CandidateEvidenceHistoryStabilityDelta[
+3933:        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+3936:        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+3943:        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+3946:        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+3953:        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+3956:        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+3963:        ld2410CandidateEvidenceHistorySeparationDelta[
+3966:        ld2410CandidateEvidenceHistorySeparationDelta[
+3973:        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+3976:        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+3983:        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+3986:        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+3993:        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+3996:        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+4003:        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+4006:        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+4013:        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+4016:        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+4123:          ld2410CandidateEvidenceHistoryStabilityDelta[
+4126:          ld2410CandidateEvidenceHistoryStabilityDelta[
+4131:          ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+4134:          ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+4139:          ld2410CandidateEvidenceHistoryRecurrenceDelta[
+4142:          ld2410CandidateEvidenceHistoryRecurrenceDelta[
+4147:          ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+4150:          ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+4155:          ld2410CandidateEvidenceHistorySeparationDelta[
+4158:          ld2410CandidateEvidenceHistorySeparationDelta[
+4163:          ld2410CandidateEvidenceHistorySeparationMeanDelta[
+4166:          ld2410CandidateEvidenceHistorySeparationMeanDelta[
+4171:          ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+4174:          ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+4179:          ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+4182:          ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+4187:          ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+4190:          ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+4195:          ld2410CandidateEvidenceHistoryTrajectoryDrift[
+4198:          ld2410CandidateEvidenceHistoryTrajectoryDrift[
+4316:        ld2410CandidateEvidenceHistoryStabilityDelta[
+4319:        ld2410CandidateEvidenceHistoryStabilityDelta[
+4326:        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+4329:        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+4336:        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+4339:        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+4346:        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+4349:        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+4356:        ld2410CandidateEvidenceHistorySeparationDelta[
+4359:        ld2410CandidateEvidenceHistorySeparationDelta[
+4366:        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+4369:        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+4376:        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+4379:        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+4386:        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+4389:        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+4396:        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+4399:        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+4406:        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+4409:        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+4528:        ld2410CandidateEvidenceHistoryStabilityDelta[
+4531:        ld2410CandidateEvidenceHistoryStabilityDelta[
+4538:        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+4541:        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+4548:        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+4551:        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+4558:        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+4561:        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+4568:        ld2410CandidateEvidenceHistorySeparationDelta[
+4571:        ld2410CandidateEvidenceHistorySeparationDelta[
+4578:        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+4581:        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+4588:        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+4591:        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+4598:        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+4601:        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+4608:        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+4611:        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+4618:        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+4621:        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+4770:        ld2410CandidateEvidenceHistoryStabilityDelta[
+4773:        ld2410CandidateEvidenceHistoryStabilityDelta[
+4780:        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+4783:        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+4790:        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+4793:        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+4800:        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+4803:        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+4810:        ld2410CandidateEvidenceHistorySeparationDelta[
+4813:        ld2410CandidateEvidenceHistorySeparationDelta[
+4820:        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+4823:        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+4830:        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+4833:        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+4840:        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+4843:        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+4850:        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+4853:        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+4860:        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+4863:        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+5020:        ld2410CandidateEvidenceHistoryStabilityDelta[
+5023:        ld2410CandidateEvidenceHistoryStabilityDelta[
+5030:        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+5033:        ld2410CandidateEvidenceHistoryStabilityMeanDelta[
+5040:        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+5043:        ld2410CandidateEvidenceHistoryRecurrenceDelta[
+5050:        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+5053:        ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[
+5060:        ld2410CandidateEvidenceHistorySeparationDelta[
+5063:        ld2410CandidateEvidenceHistorySeparationDelta[
+5070:        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+5073:        ld2410CandidateEvidenceHistorySeparationMeanDelta[
+5080:        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+5083:        ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[
+5090:        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+5093:        ld2410CandidateEvidenceHistoryTrajectoryStepDelta[
+5100:        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+5103:        ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[
+5110:        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+5113:        ld2410CandidateEvidenceHistoryTrajectoryDrift[
+5208:      ld2410CandidateEvidenceHistoryStabilityDelta[currentIndex],
+5209:      ld2410CandidateEvidenceHistoryStabilityDelta[priorIndex]
+5214:      ld2410CandidateEvidenceHistoryStabilityMeanDelta[currentIndex],
+5215:      ld2410CandidateEvidenceHistoryStabilityMeanDelta[priorIndex]
+5220:      ld2410CandidateEvidenceHistoryRecurrenceDelta[currentIndex],
+5221:      ld2410CandidateEvidenceHistoryRecurrenceDelta[priorIndex]
+5226:      ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[currentIndex],
+5227:      ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[priorIndex]
+5232:      ld2410CandidateEvidenceHistorySeparationDelta[currentIndex],
+5233:      ld2410CandidateEvidenceHistorySeparationDelta[priorIndex]
+5238:      ld2410CandidateEvidenceHistorySeparationMeanDelta[currentIndex],
+5239:      ld2410CandidateEvidenceHistorySeparationMeanDelta[priorIndex]
+5244:      ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[currentIndex],
+5245:      ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[priorIndex]
+5250:      ld2410CandidateEvidenceHistoryTrajectoryStepDelta[currentIndex],
+5251:      ld2410CandidateEvidenceHistoryTrajectoryStepDelta[priorIndex]
+5256:      ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[currentIndex],
+5257:      ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[priorIndex]
+5262:      ld2410CandidateEvidenceHistoryTrajectoryDrift[currentIndex],
+5263:      ld2410CandidateEvidenceHistoryTrajectoryDrift[priorIndex]
+5472:  if (!ld2410CandidateEvidenceValid) {
+5482:  ld2410CandidateEvidenceHistoryStabilitySamples[slot] =
+5485:  ld2410CandidateEvidenceHistoryStabilityDelta[slot] =
+5488:  ld2410CandidateEvidenceHistoryStabilityMeanDelta[slot] =
+5491:  ld2410CandidateEvidenceHistoryRecurrenceSamples[slot] =
+5494:  ld2410CandidateEvidenceHistoryRecurrenceDelta[slot] =
+5497:  ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[slot] =
+5500:  ld2410CandidateEvidenceHistorySeparationSamples[slot] =
+5503:  ld2410CandidateEvidenceHistorySeparationDelta[slot] =
+5506:  ld2410CandidateEvidenceHistorySeparationMeanDelta[slot] =
+5509:  ld2410CandidateEvidenceHistoryTrajectorySamples[slot] =
+5512:  ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[slot] =
+5515:  ld2410CandidateEvidenceHistoryTrajectoryStepDelta[slot] =
+5518:  ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[slot] =
+5521:  ld2410CandidateEvidenceHistoryTrajectoryDrift[slot] =
+5566:      ld2410CandidateEvidenceHistoryStabilitySamples[slot],
+5567:    ld2410CandidateEvidenceHistoryStabilityDelta[slot],
+5568:    ld2410CandidateEvidenceHistoryStabilityMeanDelta[slot],
+5570:      ld2410CandidateEvidenceHistoryRecurrenceSamples[slot],
+5571:    ld2410CandidateEvidenceHistoryRecurrenceDelta[slot],
+5572:    ld2410CandidateEvidenceHistoryRecurrenceMeanDelta[slot],
+5574:      ld2410CandidateEvidenceHistorySeparationSamples[slot],
+5575:    ld2410CandidateEvidenceHistorySeparationDelta[slot],
+5576:    ld2410CandidateEvidenceHistorySeparationMeanDelta[slot],
+5578:      ld2410CandidateEvidenceHistoryTrajectorySamples[slot],
+5579:    ld2410CandidateEvidenceHistoryTrajectoryFirstDelta[slot],
+5580:    ld2410CandidateEvidenceHistoryTrajectoryStepDelta[slot],
+5581:    ld2410CandidateEvidenceHistoryTrajectoryMeanStepDelta[slot],
+5582:    ld2410CandidateEvidenceHistoryTrajectoryDrift[slot]
+5734:    ld2410CandidateEvidenceValid = true;
+5763:  uint8_t movingEnergyMedian,
+5764:  uint8_t stationaryEnergyMedian
+5821:        movingEnergyMedian,

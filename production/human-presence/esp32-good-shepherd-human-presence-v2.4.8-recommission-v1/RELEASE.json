@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "deviceFamily": "human-presence",
+  "firmwareVersion": "esp32-good-shepherd-human-presence-v2.4.8-recommission-v1",
+  "releaseTag": "v2.4.8-recommission-20260924",
+  "assetName": "good_shepherd_esp32_human_presence.ino.bin",
+  "assetSha256": "869dac0a8791be3caa66d81d57adfe0e490223eb4c3cc89f5e23ed4d90bb0ff5",
+  "githubReleaseUrl": "https://github.com/thriveks/good-shepherd-esp32-firmware/releases/tag/v2.4.8-recommission-20260924",
+  "otaDownloadUrl": "https://good-shepherd-server-j06f.onrender.com/firmware/human-presence/download/v2.4.8-recommission-20260924/good_shepherd_esp32_human_presence.ino.bin",
+  "binaryStorage": "github-release-asset",
+  "sourceParity": "UNVERIFIED",
+  "reproducibleBuild": "UNVERIFIED",
+  "sourceRevision": null,
+  "note": "Release binary metadata is verified against GitHub. Do not infer that development/workbench source produced this binary. Preserve OTA release assets unchanged."
+}

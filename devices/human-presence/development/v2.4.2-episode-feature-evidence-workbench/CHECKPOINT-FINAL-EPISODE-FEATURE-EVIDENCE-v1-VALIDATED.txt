@@ -1,0 +1,128 @@
+GOOD SHEPHERD HOME MONITORING SYSTEM
+Human Presence Firmware v2.4.2
+Episode Feature Evidence v1
+FINAL VALIDATION CHECKPOINT
+
+STATUS
+HARDWARE VALIDATED
+PRODUCTION PIPELINE VALIDATED
+READY TO FREEZE
+
+VALIDATED FIRMWARE
+Software Version:
+esp32-good-shepherd-human-presence-v2.4.2-episode-feature-evidence
+
+Source SHA-256:
+654c0f4a11379850022d6bec05b5a2643fbd95bb347d4820562716f70e839137
+
+Deterministic Application Binary SHA-256:
+6deb698b579f3c16a9af284ddef9d83d7846d0ca595c3adfbe313f47bab65d0a
+
+Application Binary Size:
+1344704 bytes
+
+Partition Table SHA-256:
+fe66cdf53d5216316f59ec446e68820b32de1de31d751799d48a8df2452f72fa
+
+HARDWARE VALIDATION TARGET
+Sensor:
+Sensor 9
+
+Node:
+esp32-a02dbcabc31c
+
+Flash Method:
+Arduino-style segmented flash
+bootloader 0x1000
+partitions 0x8000
+boot_app0 0xe000
+application 0x10000
+NVS preserved
+
+PRODUCTION EVIDENCE
+Validated Event:
+esp32-a02dbcabc31c-candidate-history-947449885d0fe53e-27
+
+Evidence Schema:
+1.1
+
+Episode:
+27
+
+History Count:
+8
+
+Prior Count:
+7
+
+Behavioral Comparison Dimensions:
+10
+
+Episode Profile:
+Present
+
+Episode Profile Field Count:
+12
+
+Assignment Authority Resolution:
+resolved_assigned_sensor
+
+Authoritative Resident:
+Good shepherd office
+
+Authoritative Location:
+mmWave prototype
+
+DOWNSTREAM VALIDATION
+Interpretation:
+human_presence_candidate_interpretation_v1
+PASS
+
+Decision Readiness:
+human_presence_decision_readiness_v1
+PASS
+
+Operational Classification:
+NULL / intentionally absent
+
+Alert Level:
+NULL / intentionally absent
+
+Monitoring Action:
+NULL / intentionally absent
+
+TRANSPORT IDENTITY VALIDATION
+Boot-session nonce:
+947449885d0fe53e
+
+Validated event identity format:
+<nodeId>-candidate-history-<16-hex-boot-session>-<episodeId>
+
+Multiple Schema 1.1 events from the same boot persisted independently.
+The prior cross-reboot episode-ID collision failure is resolved without weakening database idempotency and without NVS persistence.
+
+SCOPE PRESERVATION
+No behavioral threshold changes.
+No candidate-learning math changes.
+No trusted-baseline changes.
+No promotion-policy changes.
+No fall classification.
+No emergency classification.
+No medical inference.
+No alert-policy changes.
+No monitoring/intervention policy changes.
+
+VALIDATED PIPELINE
+Sensor 9
+-> completed candidate episode
+-> Episode Feature Evidence v1
+-> MQTT evidence transport
+-> Schema 1.1 production persistence
+-> Human Presence Interpretation v1
+-> Human Presence Decision Readiness v1
+
+RESULT
+PASS
+
+This workbench is the validated v2.4.2 Episode Feature Evidence v1 checkpoint.
+Further development must occur in a child workbench. Do not modify this validated checkpoint.

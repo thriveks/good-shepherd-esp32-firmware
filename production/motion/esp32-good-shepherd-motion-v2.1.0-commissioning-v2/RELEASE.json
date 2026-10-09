@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "deviceFamily": "motion",
+  "firmwareVersion": "esp32-good-shepherd-motion-v2.1.0-commissioning-v2",
+  "releaseTag": "v2.1.0-commissioning-v2-recommission-20260924",
+  "assetName": "good_shepherd_esp32_motion.ino.bin",
+  "assetSha256": "24d89a796035ce905aff281de17867bb4caef1750dad2f4a03d09eb04b9e345f",
+  "githubReleaseUrl": "https://github.com/thriveks/good-shepherd-esp32-firmware/releases/tag/v2.1.0-commissioning-v2-recommission-20260924",
+  "otaDownloadUrl": "https://good-shepherd-server-j06f.onrender.com/firmware/download/v2.1.0-commissioning-v2-recommission-20260924/good_shepherd_esp32_motion.ino.bin",
+  "binaryStorage": "github-release-asset",
+  "sourceParity": "UNVERIFIED",
+  "reproducibleBuild": "UNVERIFIED",
+  "sourceRevision": null,
+  "note": "Release binary metadata is verified against GitHub. Do not infer that development/workbench source produced this binary. Preserve OTA release assets unchanged."
+}
