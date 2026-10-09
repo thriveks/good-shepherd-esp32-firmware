@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "deviceFamily": "motion",
+  "firmwareVersion": "esp32-good-shepherd-motion-v2.1.0-commissioning-v2",
+  "activeOtaReleaseTag": "v2.1.0-commissioning-v2-recommission-20260924",
+  "publishedAssets": [
+    {
+      "role": "original-commissioning",
+      "releaseTag": "v2.1.0-commissioning-v2",
+      "assetName": "good_shepherd_esp32_motion.ino.bin",
+      "sha256": "06c559484a7b876a88a0c28daa8a353b53dcd3939f089a6a4a2f0ecad915363d",
+      "sizeBytes": 1350576,
+      "releaseUrl": "https://github.com/thriveks/good-shepherd-esp32-firmware/releases/tag/v2.1.0-commissioning-v2"
+    },
+    {
+      "role": "current-ota-recommission",
+      "releaseTag": "v2.1.0-commissioning-v2-recommission-20260924",
+      "assetName": "good_shepherd_esp32_motion.ino.bin",
+      "sha256": "24d89a796035ce905aff281de17867bb4caef1750dad2f4a03d09eb04b9e345f",
+      "sizeBytes": 1350432,
+      "releaseUrl": "https://github.com/thriveks/good-shepherd-esp32-firmware/releases/tag/v2.1.0-commissioning-v2-recommission-20260924"
+    }
+  ],
+  "localProtectedApplicationObservation": {
+    "sha256ReportedByWork": "06c559484a7b876a88a0c28daa8a353b53dcd3939f089a6a4a2f0ecad915363d",
+    "source": "Work summary pasted by user (2026-10-08); source REPORT.md and sanitized tarball not ingested into this chat",
+    "independentlyReverifiedFromLocalFile": false,
+    "matches": "original-commissioning",
+    "differsFromActiveOta": true
+  },
+  "provenanceStatus": "UNRESOLVED",
+  "note": "Do not replace the current OTA asset or rewrite a Mac production pointer solely to resolve this difference. A matching firmwareVersion string does not establish identical firmware behavior, build provenance, or exact source parity."
+}

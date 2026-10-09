@@ -15,11 +15,13 @@ The OTA service publishes these versions through:
 
 The OTA binaries are release assets, **not** the default-branch Arduino sketch.
 
-## Source-code verification status: NOT YET SYNCHRONIZED
+**Motion variant discrepancy (2026-10-08):** The earlier [original commissioning release](https://github.com/thriveks/good-shepherd-esp32-firmware/releases/tag/v2.1.0-commissioning-v2) has SHA-256 `06c55948...`, while the currently active OTA [recommission release](https://github.com/thriveks/good-shepherd-esp32-firmware/releases/tag/v2.1.0-commissioning-v2-recommission-20260924) has SHA-256 `24d89a79...`. Work reports the protected Mac application binary matches the **original** variant, not the active OTA. These are different artifacts despite a shared firmware version string; see [reconciliation status](production/RECONCILIATION_STATUS.md) and [machine-readable variant record](production/motion/OTA_VARIANTS.json). GitHub `CURRENT` pointers describe active OTA only, not local Mac manufacturing packages.
+
+## Production source parity: UNVERIFIED
 
 **Do not build or debug current production firmware from `good_shepherd_esp32_motion/good_shepherd_esp32_motion.ino`.** This checked-in sketch identifies itself as `esp32-good-shepherd-v1.9.5-true-lite-heartbeat` and is an older historical implementation. The sketch associated with the current motion release tag also identifies as v1.9.5; this does **not** establish that it produced the v2.1.0 binary.
 
-The human-presence v2.4.8 production source is likewise **not present** on this repository's default branch. Neither active firmware asset has an independently verified, reproducible source-to-binary build recorded here.
+The authoritative human-presence v2.4.8 protected production source has **not yet been imported** into this repository; the checked-in development workbench goes only through v2.4.6. Neither active firmware asset has an independently verified, reproducible source-to-binary build recorded here.
 
 Authoritative local production pointers previously established for the manufacturer are:
 - `Desktop/production/motion/CURRENT`
