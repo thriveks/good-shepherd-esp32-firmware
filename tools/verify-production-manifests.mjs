@@ -29,6 +29,6 @@ for (const family of families) {
   assert.equal(entry.assetName, expectedAsset);
   assert.equal(entry.githubReleaseUrl, `https://github.com/thriveks/good-shepherd-esp32-firmware/releases/tag/${entry.releaseTag}`);
   assert.equal(entry.otaDownloadUrl, `https://good-shepherd-server-j06f.onrender.com${expectedRoute}${entry.releaseTag}/${entry.assetName}`);
-  process.stdout.write(`PASS ${family}: ${pointer} [source parity: ${entry.sourceParity}]\\n`);
+  process.stdout.write(`PASS ${family}: ${pointer} [source parity: ${entry.sourceParity}]\n`);
 }
-process.stdout.write("PASS firmware production manifest structure\\n");
+process.stdout.write("PASS firmware production manifest structure\n");
