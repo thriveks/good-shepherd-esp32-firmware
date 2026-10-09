@@ -1,0 +1,103 @@
+{
+  "schemaVersion": 1,
+  "evidenceDate": "2026-10-08",
+  "source": "Good Shepherd Firmware Verification REPORT.md located in connected Google Drive; findings reported by Mac-side Work",
+  "directlyInspectedProtectedMacFiles": false,
+  "releaseChecksumVerification": "separately confirmed with GitHub Releases and production Render registry",
+  "families": {
+    "motion": {
+      "localReleaseDirectory": "production/motion/v2.1.0-commissioning-v2",
+      "firmwareVersion": "esp32-good-shepherd-motion-v2.1.0-commissioning-v2",
+      "sourceSha256": "13bf5fb93f1053bcb76e7606c2b6e9b8a4ce6b6b58aafd0bf414ccd4180e4f67",
+      "localSourceGitRevision": null,
+      "sourceRelationToGithubDevelopmentWorkbench": "report states protected source is byte-identical to current GitHub motion workbench",
+      "sourceCorrespondence": "metadata-normalized segments equivalent to active OTA; excludes descriptor ELF digest, sketch date/time and trailing checksum/SHA fields; NOT byte-exact",
+      "protectedArtifacts": [
+        {
+          "name": "firmware.bin",
+          "sizeBytes": 1350576,
+          "sha256": "06c559484a7b876a88a0c28daa8a353b53dcd3939f089a6a4a2f0ecad915363d"
+        },
+        {
+          "name": "partitions.bin",
+          "sizeBytes": 3072,
+          "sha256": "0a8b5720e7b77ff11f1462458c3a509dee79224e5279898f26d6a2e3ae0517b7"
+        },
+        {
+          "name": "boot_app0.bin",
+          "sizeBytes": 8192,
+          "sha256": "f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0"
+        },
+        {
+          "name": "bootloader.bin",
+          "sizeBytes": 24992,
+          "sha256": "427f96e10c620c4f062dab15da54fc45494d897e8397ae6f3aecc98c42d7e379"
+        },
+        {
+          "name": "firmware.merged.bin",
+          "sizeBytes": 4194304,
+          "sha256": "6157d7fc05bce25d9c86ac421ab321fe2f41f768e7e9c0b2c0bfd37b649670c3"
+        }
+      ],
+      "activeOtaApplication": {
+        "sizeBytes": 1350432,
+        "sha256": "24d89a796035ce905aff281de17867bb4caef1750dad2f4a03d09eb04b9e345f",
+        "releaseTag": "v2.1.0-commissioning-v2-recommission-20260924"
+      },
+      "protectedApplicationMatchesActiveOta": false,
+      "protectedApplicationMatchesOriginalGithubRelease": true,
+      "originalGithubReleaseTag": "v2.1.0-commissioning-v2",
+      "rebuiltApplicationSha256": "4cf97221174cb3779f2b3fd040f7f3d9287d603258556ac9d4d40e3c4d291828",
+      "compile": "PASS",
+      "protectedSha256sums": "PASS",
+      "sourceToBinaryByteExactReproducibility": "NOT ESTABLISHED",
+      "manufacturingPromotionAuthority": "UNRESOLVED"
+    },
+    "human-presence": {
+      "localReleaseDirectory": "production/human-presence/v2.4.8-recommission-v1",
+      "firmwareVersion": "esp32-good-shepherd-human-presence-v2.4.8-recommission-v1",
+      "sourceSha256": "1e93a3ee3a9d083f40acc2d0f15c62b3f4b70f688224ad3f97513fcaa42a9cf2",
+      "localSourceGitRevision": null,
+      "sourceRelationToGithubDevelopmentWorkbench": "report states protected baseline differs in firmware version and device-name persistence/normalization; retain both variants without overwriting",
+      "sourceCorrespondence": "metadata-normalized segments equivalent to active OTA; excludes descriptor ELF digest, sketch date/time and trailing checksum/SHA fields; NOT byte-exact",
+      "protectedArtifacts": [
+        {
+          "name": "firmware.bin",
+          "sizeBytes": 1352752,
+          "sha256": "869dac0a8791be3caa66d81d57adfe0e490223eb4c3cc89f5e23ed4d90bb0ff5"
+        },
+        {
+          "name": "partitions.bin",
+          "sizeBytes": 3072,
+          "sha256": "0a8b5720e7b77ff11f1462458c3a509dee79224e5279898f26d6a2e3ae0517b7"
+        },
+        {
+          "name": "boot_app0.bin",
+          "sizeBytes": 8192,
+          "sha256": "f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0"
+        },
+        {
+          "name": "bootloader.bin",
+          "sizeBytes": 24992,
+          "sha256": "427f96e10c620c4f062dab15da54fc45494d897e8397ae6f3aecc98c42d7e379"
+        },
+        {
+          "name": "firmware.merged.bin",
+          "sizeBytes": 4194304,
+          "sha256": "08a9503f80c83a9647c8e686d84e09c61687cf1a33dc7c5577865c031b778a42"
+        }
+      ],
+      "activeOtaApplication": {
+        "sizeBytes": 1352752,
+        "sha256": "869dac0a8791be3caa66d81d57adfe0e490223eb4c3cc89f5e23ed4d90bb0ff5",
+        "releaseTag": "v2.4.8-recommission-20260924"
+      },
+      "protectedApplicationMatchesActiveOta": true,
+      "rebuiltApplicationSha256": "603f1970f4f161a2270b313ba60b0c72c6f39794558326fde5c700172dc41493",
+      "compile": "PASS",
+      "protectedSha256sums": "PASS",
+      "sourceToBinaryByteExactReproducibility": "NOT ESTABLISHED",
+      "manufacturingPromotionAuthority": "UNRESOLVED"
+    }
+  }
+}

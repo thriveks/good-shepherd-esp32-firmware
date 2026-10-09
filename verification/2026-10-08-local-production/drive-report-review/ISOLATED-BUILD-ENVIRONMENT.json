@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "source": "Mac-side 2026-10-08 Work verification report; a reconstruction recipe, not evidence of the original historical build inputs",
+  "testedToolchain": {
+    "arduinoCli": "1.5.1",
+    "esp32ArduinoCore": "3.3.11",
+    "xtensaGcc": "14.2.0",
+    "crosstoolNg": "esp-14.2.0_20260121",
+    "espX32Package": "2601",
+    "esptool": "5.3.1",
+    "libraries": {
+      "NimBLE-Arduino": "2.5.1",
+      "PubSubClient": "2.8"
+    }
+  },
+  "testedCommand": "arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs --build-path <isolated-output> <isolated-sketch>",
+  "buildConfig": {
+    "compilerOptimization": "-Os",
+    "flashMode": "dio",
+    "flashFrequencyMHz": 80,
+    "flashSizeMB": 4,
+    "customBuildProperties": false,
+    "flashOffsets": {
+      "bootloader": "0x1000",
+      "partitions": "0x8000",
+      "boot_app0": "0xe000",
+      "application": "0x10000"
+    }
+  },
+  "partitionLayout": [
+    {
+      "label": "nvs",
+      "offset": "0x9000",
+      "size": "0x5000"
+    },
+    {
+      "label": "otadata",
+      "offset": "0xe000",
+      "size": "0x2000"
+    },
+    {
+      "label": "app0",
+      "offset": "0x10000",
+      "size": "0x1e0000"
+    },
+    {
+      "label": "app1",
+      "offset": "0x1f0000",
+      "size": "0x1e0000"
+    },
+    {
+      "label": "spiffs",
+      "offset": "0x3d0000",
+      "size": "0x20000"
+    },
+    {
+      "label": "coredump",
+      "offset": "0x3f0000",
+      "size": "0x10000"
+    }
+  ],
+  "sourcesOfPartitionConfig": {
+    "motion": "esp32 Arduino core tools/partitions/min_spiffs.csv",
+    "humanPresence": "explicit partitions.csv in protected source package"
+  },
+  "fullByteReproducibility": "NOT ESTABLISHED",
+  "executableSegmentComparison": "Six segment offsets and sizes match; segments 1-5 byte-identical, segment 0 differs at ELF descriptor digest (offset 176), sketch compile timestamps, and trailing checksum/SHA; detailed excluded ranges only in Mac-side verification.json, not available in this chat",
+  "missingHistoricalProvenance": [
+    "original arduino-cli version",
+    "original source and build directory identity",
+    "complete effective build properties",
+    "compile timestamp and path controls",
+    "historical ELF/debug paths",
+    "historical cache state",
+    "source Git commit provenance"
+  ],
+  "notes": [
+    "Isolated rebuilds compiled for both device families.",
+    "Bootloader, boot_app0 and partitions.bin reproduce exactly for both.",
+    "The clean source package is required to import protected source snapshots; this metadata file is not a substitute.",
+    "Sanitized source cannot by itself reproduce original private-configuration builds."
+  ]
+}
