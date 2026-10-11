@@ -2,7 +2,7 @@ name: Publish immutable OTA binaries
 on:
   push:
     branches: [main]
-    paths: ['ota-inbox/**']
+    paths: ['ota-inbox/**', 'tools/publish_ota.py', 'tests/test_publish_ota.py', '.github/workflows/publish-ota.yml']
   workflow_dispatch:
 permissions:
   contents: write
@@ -20,4 +20,6 @@ jobs:
       - name: Verify inbox and publish immutable release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 tools/publish_ota.py
+        run: |
+          python3 -m unittest discover -s tests -v
+          python3 tools/publish_ota.py
