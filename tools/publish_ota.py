@@ -20,6 +20,16 @@ def api(path):
     return json.loads(command(["gh", "api", "repos/" + REPO + "/" + path]))
 
 
+def find_release(tag):
+    # Drafts need not have a Git tag yet and GET releases/tags/<tag> returns 404.
+    # Enumerate authenticated releases, including drafts, before creating anything.
+    pages = json.loads(command(["gh", "api", f"repos/{REPO}/releases?per_page=100", "--paginate", "--slurp"]))
+    matches = [r for page in pages for r in page if r["tag_name"] == tag]
+    if len(matches) > 1:
+        raise ValueError("Ambiguous release identity")
+    return matches[0] if matches else None
+
+
 def main():
     # The bootstrap enables repository immutability. Its settings endpoint requires
     # admin access, which the publishing token deliberately lacks. Verify the
@@ -38,15 +48,12 @@ def main():
         image = asset.read_bytes()
         if image[:1] != b"\xe9" or len(image) > 0x1E0000 or hashlib.sha256(image).hexdigest() != r["sha256"] or r["firmwareVersion"].encode() + b"\0" not in image:
             raise ValueError("Application digest/header/slot/version mismatch")
-        probe = subprocess.run(["gh", "api", f"repos/{REPO}/releases/tags/{r['tag']}"], capture_output=True, text=True)
-        if probe.returncode:
-            # Distinguish absence from API/auth/transient errors.
-            if "HTTP 404" not in probe.stderr:
-                raise RuntimeError("Release lookup failed")
+        release = find_release(r["tag"])
+        if release is None:
             command(["gh", "release", "create", r["tag"], "-R", REPO, "--target", "main", "--draft", "--prerelease", "--title", r["firmwareVersion"], "--notes", "Approved OTA application; staging does not activate production. SHA-256: " + r["sha256"]])
-            release = api("releases/tags/" + r["tag"])
-        else:
-            release = json.loads(probe.stdout)
+            release = find_release(r["tag"])
+            if release is None:
+                raise RuntimeError("New draft not found")
         if release["draft"]:
             # Resume interrupted draft creation without overwriting any existing asset.
             assets = {a["name"]: a for a in release["assets"]}
