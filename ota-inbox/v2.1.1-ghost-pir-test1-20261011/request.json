@@ -1,0 +1,8 @@
+{
+  "family": "motion",
+  "firmwareVersion": "esp32-good-shepherd-motion-v2.1.1-ghost-pir-test1",
+  "sha256": "66f732c1993bccae46c072a3d98a975fdc5dcc74244a1d5e31188d289b96b8c0",
+  "sourceRevision": "3b5809a33a0bffdb9705178d38796a10f129de40",
+  "runId": 38163123507,
+  "tag": "v2.1.1-ghost-pir-test1-20261011"
+}
