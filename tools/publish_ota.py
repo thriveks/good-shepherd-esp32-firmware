@@ -21,8 +21,9 @@ def api(path):
 
 
 def main():
-    if api("immutable-releases").get("enabled") is not True:
-        raise ValueError("Repository release immutability must be enabled")
+    # The bootstrap enables repository immutability. Its settings endpoint requires
+    # admin access, which the publishing token deliberately lacks. Verify the
+    # resulting release's immutable flag below, and fail registration if absent.
     for request in sorted(Path("ota-inbox").glob("*/request.json")):
         r = json.loads(request.read_text())
         family = r["family"]
