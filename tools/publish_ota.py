@@ -37,7 +37,7 @@ def main():
     for request in sorted(Path("ota-inbox").glob("*/request.json")):
         r = json.loads(request.read_text())
         family = r["family"]
-        if family not in ("motion", "human-presence") or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", r["tag"]) or request.parent.name != r["tag"]:
+        if family not in ("motion", "human-presence", "thermal") or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", r["tag"]) or request.parent.name != r["tag"]:
             raise ValueError("Invalid inbox release identity")
         if not re.fullmatch("esp32-good-shepherd-" + family + r"-[A-Za-z0-9._-]+", r["firmwareVersion"]) or not re.fullmatch(r"[a-f0-9]{64}", r["sha256"]) or not re.fullmatch(r"[a-f0-9]{40}", r["sourceRevision"]):
             raise ValueError("Invalid provenance")
