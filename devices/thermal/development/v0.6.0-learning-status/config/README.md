@@ -1,0 +1,1 @@
+Copy PrivateConfig.example.h to ../source/good_shepherd_thermal/PrivateConfig.h and fill in your local connection settings before building. The private file is intentionally excluded from Git. Never commit credentials.

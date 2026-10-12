@@ -3,3 +3,16 @@ build/
 *.bin
 *.elf
 *.map
+
+# Thermal source checkpoints exclude local credentials and generated/private data.
+**/PrivateConfig.h
+/devices/thermal/archive/*
+!/devices/thermal/archive/README.md
+!/devices/thermal/archive/MANIFEST.json
+!/devices/thermal/archive/protected-production-checkpoint.json
+/devices/thermal/development/*/artifacts/
+/devices/thermal/development/*/evidence/
+/devices/thermal/development/*/tool-state/
+/devices/thermal/development/*/arduino-cli.yaml
+**/.DS_Store
+**/__pycache__/

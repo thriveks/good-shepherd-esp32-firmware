@@ -1,0 +1,113 @@
+{
+  "production/motion/CURRENT": {
+    "symlink": "v2.1.0-commissioning-v2"
+  },
+  "production/motion/v2.0.13-power-recovery/README.md": {
+    "sha256": "cbb6a822c6d31831064edd23e4a33e49f7525174469fd0246c2cc93aa5e97ff6"
+  },
+  "production/motion/v2.1.0-commissioning-v2/partitions.bin": {
+    "sha256": "0a8b5720e7b77ff11f1462458c3a509dee79224e5279898f26d6a2e3ae0517b7"
+  },
+  "production/motion/v2.1.0-commissioning-v2/boot_app0.bin": {
+    "sha256": "f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0"
+  },
+  "production/motion/v2.1.0-commissioning-v2/MANIFEST.md": {
+    "sha256": "eb6b9bf019577e59224ccac0be7fbd3c24d64dcbef0e3b4e1d040f679083b486"
+  },
+  "production/motion/v2.1.0-commissioning-v2/firmware.bin": {
+    "sha256": "06c559484a7b876a88a0c28daa8a353b53dcd3939f089a6a4a2f0ecad915363d"
+  },
+  "production/motion/v2.1.0-commissioning-v2/VERSION": {
+    "sha256": "ea5cbf561148ecf33308a21d582ef0db41c3c0497755adf29753695108c5346f"
+  },
+  "production/motion/v2.1.0-commissioning-v2/bootloader.bin": {
+    "sha256": "427f96e10c620c4f062dab15da54fc45494d897e8397ae6f3aecc98c42d7e379"
+  },
+  "production/motion/v2.1.0-commissioning-v2/firmware.merged.bin": {
+    "sha256": "6157d7fc05bce25d9c86ac421ab321fe2f41f768e7e9c0b2c0bfd37b649670c3"
+  },
+  "production/motion/v2.1.0-commissioning-v2/SHA256SUMS": {
+    "sha256": "03a040347d56b4c684d314660cafc032581acd06b6fd166dbb617e2ba390e0db"
+  },
+  "production/motion/v2.1.0-commissioning-v2/source/good_shepherd_esp32_motion/good_shepherd_esp32_motion.ino.before-recommission-20260924-125923": {
+    "sha256": "dc258abbeb53ee1b0832a16d26662351d7e8723b7caf2cc6cb44b8296c0e1fc7"
+  },
+  "production/motion/v2.1.0-commissioning-v2/source/good_shepherd_esp32_motion/good_shepherd_esp32_motion.ino": {
+    "sha256": "13bf5fb93f1053bcb76e7606c2b6e9b8a4ce6b6b58aafd0bf414ccd4180e4f67"
+  },
+  "production/human-presence/CURRENT": {
+    "symlink": "v2.4.8-recommission-v1"
+  },
+  "production/human-presence/v2.4.8-recommission-v1/partitions.bin": {
+    "sha256": "0a8b5720e7b77ff11f1462458c3a509dee79224e5279898f26d6a2e3ae0517b7"
+  },
+  "production/human-presence/v2.4.8-recommission-v1/boot_app0.bin": {
+    "sha256": "f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0"
+  },
+  "production/human-presence/v2.4.8-recommission-v1/MANIFEST.md": {
+    "sha256": "93fb19add6d493df5b417ba4706e15bccf687ee08ea0f4057a1f413351257dec"
+  },
+  "production/human-presence/v2.4.8-recommission-v1/firmware.bin": {
+    "sha256": "869dac0a8791be3caa66d81d57adfe0e490223eb4c3cc89f5e23ed4d90bb0ff5"
+  },
+  "production/human-presence/v2.4.8-recommission-v1/VERSION": {
+    "sha256": "03786510cbff1e058d7894d77cf3322aebc93c89f48c8c6fa3b192d0162e1c51"
+  },
+  "production/human-presence/v2.4.8-recommission-v1/bootloader.bin": {
+    "sha256": "427f96e10c620c4f062dab15da54fc45494d897e8397ae6f3aecc98c42d7e379"
+  },
+  "production/human-presence/v2.4.8-recommission-v1/firmware.merged.bin": {
+    "sha256": "08a9503f80c83a9647c8e686d84e09c61687cf1a33dc7c5577865c031b778a42"
+  },
+  "production/human-presence/v2.4.8-recommission-v1/SHA256SUMS": {
+    "sha256": "584d9bfba6c9de5058b826652fb0ef43dc60acebf63fc9e74ee2f475cda7c706"
+  },
+  "production/human-presence/v2.4.8-recommission-v1/source/good_shepherd_esp32_human_presence/good_shepherd_esp32_human_presence.ino.before-adaptive-capture-v1-20260917-071925": {
+    "sha256": "4ca071cebb56b805d35a0422f5c67789059339b12cd45a4d6019280fee5b544f"
+  },
+  "production/human-presence/v2.4.8-recommission-v1/source/good_shepherd_esp32_human_presence/good_shepherd_esp32_human_presence.ino.before-engineering-command-support": {
+    "sha256": "78cf1427574d45557da45c144a0293777637e5f78ea979c830cbdbad17c74731"
+  },
+  "production/human-presence/v2.4.8-recommission-v1/source/good_shepherd_esp32_human_presence/good_shepherd_esp32_human_presence.ino.before-capture-provenance-v1-20260919-132849": {
+    "sha256": "d03f6694ebd3b1e0d016d1725bf6d5b0b428d8faf0dd92747ad7cede1aedbc10"
+  },
+  "production/human-presence/v2.4.8-recommission-v1/source/good_shepherd_esp32_human_presence/good_shepherd_esp32_human_presence.ino.before-engineering-parser": {
+    "sha256": "f6d09d64470f4d6d519e119980532e596c9499dd8976ee3957623f000a216d00"
+  },
+  "production/human-presence/v2.4.8-recommission-v1/source/good_shepherd_esp32_human_presence/good_shepherd_esp32_human_presence.ino": {
+    "sha256": "1e93a3ee3a9d083f40acc2d0f15c62b3f4b70f688224ad3f97513fcaa42a9cf2"
+  },
+  "production/human-presence/v2.4.8-recommission-v1/source/good_shepherd_esp32_human_presence/good_shepherd_esp32_human_presence.ino.before-recommission-20260924-125923": {
+    "sha256": "c4d04f7123e984719b3bb2118f6fda63224fdda4c4fbdf220557eda3c4381f65"
+  },
+  "production/human-presence/v2.4.8-recommission-v1/source/good_shepherd_esp32_human_presence/partitions.csv": {
+    "sha256": "38a00264bb4ba39e0bbcabbf4ea9e52edbf66c5d27ef8e30ea7c30afed041d71"
+  },
+  "protected-fleet-backups/motion/v2.0.13-power-recovery/good_shepherd_esp32_motion.ino": {
+    "sha256": "9d64fe251432c0745f38906fb232a6e9b6d10268b894b46e5441930ed67a40a3"
+  },
+  "protected-fleet-backups/motion/v2.0.13-power-recovery/PROTECTED_FLEET_FIRMWARE.txt": {
+    "sha256": "26fc72a191169263cf445c7fc4346c92a1bcdda8a8b6b1e19b589ba5537aba94"
+  },
+  "tools/Flash Good Shepherd Sensor.command.pre-batch-20260930-140055.bak": {
+    "sha256": "a0b050d92947c34c0c340c73d1da86c287fb010c0aedba2be1be68cb5e3d8c65"
+  },
+  "tools/Flash Good Shepherd Sensor.command": {
+    "sha256": "9938b996a2f994635913c7bd3dd82983e63200e2aa2f279b19074d8c0b24933a"
+  },
+  "tools/Flash Good Shepherd Sensor.command.pre-inventory-registration-20260930-133205.bak": {
+    "sha256": "6a9cae3483784b7002b5263c895bf1172666ef66ce5eab60f124f145a1c7548f"
+  },
+  "tools/Flash Good Shepherd Sensor.command.candidate-20260930-133433": {
+    "sha256": "a0b050d92947c34c0c340c73d1da86c287fb010c0aedba2be1be68cb5e3d8c65"
+  },
+  "tools/Flash Good Shepherd Sensor.command.pre-registration-fix-20260930-133433.bak": {
+    "sha256": "6a9cae3483784b7002b5263c895bf1172666ef66ce5eab60f124f145a1c7548f"
+  },
+  "tools/Flash Motion Sensor.command": {
+    "sha256": "549703cb055b6e1326d866d805f1e69ac242702f08161ce5bf71c17ee7a6d345"
+  },
+  "tools/Flash Good Shepherd Sensor.command.pre-summary-fix-20260930-140932.bak": {
+    "sha256": "a6a489146ab2d46787dcc9514394c88231c5be547c4bddd8e83b4d0df8bbeb89"
+  }
+}

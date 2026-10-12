@@ -1,5 +1,10 @@
-# Thermal Sensor Firmware
+# Good Shepherd thermal firmware
 
-Reserved for future Good Shepherd thermal-sensor firmware development.
+Current development: [v0.6.0-learning-status](development/v0.6.0-learning-status/README.md).
 
-No production thermal firmware is stored here at this time.
+- Flash and record: development/v0.6.0-learning-status/Flash and Record Thermal.command
+- App update: development/v0.6.0-learning-status/Install Thermal App Update.command
+
+Earlier snapshots are preserved in archive. This workbench has not been promoted
+to production; its remaining physical integration checks are documented inside.
+New firmware names, sketch names and firmware artifact filenames omit "test".

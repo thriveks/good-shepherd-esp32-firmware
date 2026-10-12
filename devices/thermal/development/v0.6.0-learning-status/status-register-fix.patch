@@ -1,0 +1,13 @@
+--- a/Adafruit_MLX90640.cpp
++++ b/Adafruit_MLX90640.cpp
+@@ -94,6 +94,10 @@
+   }
+   delay(1);
+ 
++  // Status register contains self-changing ready/subpage bits. A successful
++  // I2C write is sufficient; equality readback applies only to configuration.
++  if (writeAddress == 0x8000) return 0;
++
+   if (MLX90640_I2CRead(slaveAddr, writeAddress, 1, &dataCheck) != 0) {
+     return -1;
+   }

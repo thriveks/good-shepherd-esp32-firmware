@@ -1,0 +1,45 @@
+{
+  "purpose": "Historical snapshots; contents preserved. Restore original path before using historical absolute build configurations.",
+  "entries": [
+    {
+      "originalPath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/development/v0.1.0-bringup-test1",
+      "archivePath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/archive/v0.1.0-bringup",
+      "contentsModified": false
+    },
+    {
+      "originalPath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/development/v0.2.0-system-integration-test1",
+      "archivePath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/archive/v0.2.0-system-integration",
+      "contentsModified": false
+    },
+    {
+      "originalPath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/development/v0.3.0-efficiency-test1",
+      "archivePath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/archive/v0.3.0-efficiency",
+      "contentsModified": false
+    },
+    {
+      "originalPath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/development/v0.4.0-local-ai-test1",
+      "archivePath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/archive/v0.4.0-local-ai",
+      "contentsModified": false
+    },
+    {
+      "originalPath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/development/v0.5.0-self-learning-test1",
+      "archivePath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/archive/v0.5.0-self-learning",
+      "contentsModified": false
+    },
+    {
+      "originalPath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/development/v0.5.1-self-learning-test1",
+      "archivePath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/archive/v0.5.1-self-learning",
+      "contentsModified": false
+    },
+    {
+      "originalPath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/development/v0.6.0-learning-status-test1",
+      "archivePath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/archive/v0.6.0-learning-status",
+      "contentsModified": false
+    },
+    {
+      "originalPath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/development/v0.6.0-learning-status",
+      "archivePath": "/Users/mtamacmini/Desktop/good-shepherd-esp32-firmware/devices/thermal/archive/v0.6.0-learning-status-before-cleanup",
+      "contentsModified": false
+    }
+  ]
+}
