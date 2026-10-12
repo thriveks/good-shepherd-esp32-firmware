@@ -21,8 +21,8 @@ class PublisherSafety(unittest.TestCase):
         with patch.object(publisher, "command", return_value=json.dumps([[draft, draft]])):
             with self.assertRaises(ValueError): publisher.find_release("test")
 
-    def test_both_families_resume_drafts_and_published_retries_do_not_mutate(self):
-        for family in ("motion", "human-presence"):
+    def test_all_families_resume_drafts_and_published_retries_do_not_mutate(self):
+        for family in ("motion", "human-presence", "thermal"):
             with self.subTest(family=family), tempfile.TemporaryDirectory() as temp:
                 old_cwd = Path.cwd()
                 try:
