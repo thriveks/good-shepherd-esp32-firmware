@@ -1,0 +1,1 @@
+PASS: validity, explicit calibration, regions, tracking, dwell, gaps, ambiguity, wrap, lease/cadence; 10000 stress frames in 194.007 ms; core bytes 8696

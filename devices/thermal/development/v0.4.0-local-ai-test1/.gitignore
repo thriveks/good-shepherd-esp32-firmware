@@ -1,0 +1,10 @@
+**/PrivateConfig.h
+**/build/
+artifacts/
+tool-state/
+arduino-cli.yaml
+**/__pycache__/
+.DS_Store
+evidence/*
+!evidence/build-validation.json
+!evidence/host-tests.txt
