@@ -1,0 +1,23 @@
+{
+  "status": "ENGINEERING ONLY; not flashed",
+  "twoCleanBuildsIdentical": true,
+  "artifacts": {
+    "good_shepherd_thermal_test.ino.elf": "197527d95e7a98a667618f1384b9bf01d916d392e82c45d1e6d694547afacbcd",
+    "good_shepherd_thermal_test.ino.partitions.bin": "0a8b5720e7b77ff11f1462458c3a509dee79224e5279898f26d6a2e3ae0517b7",
+    "good_shepherd_thermal_test.ino.merged.bin": "2898178114a3e6ea35bbeeef0f6610760c0b484408965c7a5b293e5ed276463e",
+    "good_shepherd_thermal_test.ino.map": "712b899868eb6d01c2e1266051e024cfa815e4efdd3798ac2f0112ad309686a1",
+    "good_shepherd_thermal_test.ino.bootloader.bin": "7784e3c3f38fa4c4334f478131488d8ba2a88ce623adca939f4cb8f019607f31",
+    "good_shepherd_thermal_test.ino.bin": "451e2fdfb68b184ad433206511c808013896260c87016ae2bbc58fb206c23fbc"
+  },
+  "applicationBytes": 1394720,
+  "compilerSketchBytes": 1394567,
+  "staticRamBytes": 84340,
+  "parentCheckpointUnchangedExceptFinderMetadata": true,
+  "excludedParentMetadataChanges": [
+    ".DS_Store"
+  ],
+  "protectedFilesAndPointersUnchanged": 37,
+  "physicalTests": "pending",
+  "OTA": "unchanged",
+  "serverDeployment": "unchanged"
+}

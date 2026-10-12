@@ -1,0 +1,18 @@
+{
+  "firmwareVersion": "esp32-good-shepherd-thermal-v0.4.0-local-ai-test1",
+  "status": "ENGINEERING ONLY; not flashed; physical validation pending",
+  "arduinoCli": "1.5.1",
+  "core": "esp32:esp32@3.3.11",
+  "parentSha256": "13bf5fb93f1053bcb76e7606c2b6e9b8a4ce6b6b58aafd0bf414ccd4180e4f67",
+  "parent": "protected Motion v2.1.0 connectivity framework; thermal sensing and dedicated identity",
+  "thermalParent": "v0.3.0-efficiency-test1 installed and receipt verified",
+  "privateConfiguration": "local PrivateConfig.h; excluded from Git/source publication",
+  "fqbn": "esp32:esp32:esp32:PartitionScheme=min_spiffs,FlashMode=dio,FlashFreq=80,FlashSize=4M",
+  "libraries": {
+    "Adafruit MLX90640": "1.1.2",
+    "PubSubClient": "2.8",
+    "Adafruit BusIO": "1.17.4",
+    "NimBLE-Arduino": "2.5.1"
+  },
+  "parentApplicationSha256": "ba91b9bd29c8772eb8d1dd8a78c3143c383946b72c693e9344a3e50eda86e0ef"
+}
