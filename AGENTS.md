@@ -1,13 +1,14 @@
-# Good Shepherd firmware engineering workflow
+# Good Shepherd ESP32 firmware engineering workflow
 
-The user expects root-cause investigation and a tested repair, not repeated confirmation requests or open-ended commentary.
+## Scoped diagnosis and repair
+1. Identify the exact device family/node, firmware version, symptom and actual source-to-binary provenance. Use existing telemetry, build receipts and past verified findings; avoid repetitive fleet audits or assuming workbench source is the deployed OTA binary.
+2. Trace the smallest failure using known diagnostics. Separate LD2410 GPIO21 coarse occupancy, UART frames, high-resolution evidence, server storage and customer-facing learning. Add a small reusable diagnostic only if needed.
+3. Make routine, authorized changes **only** in the established development/testing tree. Preserve Mac production \`CURRENT\` pointers, manufacturing artifacts, rollback packages and unrelated functionality, including watchdog/reconnection.
+4. Compile and run relevant checks, compare exact candidate and approved release digests, and report the identified physical one-device test still required. Never claim a successful command acknowledgement proves samples were captured.
+5. For publication or OTA selection use the authoritative **private** firmware-control runbook \`thriveks/good-shepherd-firmware-control/docs/PUSH-TO-OTA.md\`; the public repository is distribution, not the release-selection controller.
 
-1. Verify device family, node identity, actual firmware release label, exact source/binary relationship, and reproducible symptom before modifying code.
-2. Confirm historical vs current production behavior from real telemetry; distinguish LD2410 GPIO occupancy from UART frames, high-resolution evidence and server learning.
-3. Reuse established diagnostic commands where possible. Provide a small, safe diagnostic tool when one is missing rather than requiring the user to infer hardware state from the dashboard.
-4. Develop only in the established **development/testing** tree. Preserve protected production release artifacts and the Mac `CURRENT` pointers. Do not treat Git workbench source as verified source for an OTA production binary unless hash/build provenance is established.
-5. Do not flash, reflash, promote to production, repoint `CURRENT`, or publish OTA solely because a plausible change was made. Require a build, comparison, test evidence, rollback plan and approved production release workflow.
-6. Protect coarse GPIO21 presence detection and watchdog/reconnection functionality while investigating UART or high-res capture failures. Do not change unrelated behavior.
-7. Provide precise device-specific test instructions, results, firmware/binary identity and any remaining physical steps. Never claim a command acknowledgement proves samples were captured or delivered.
-
-Routine read-only diagnostics and authorized focused changes should proceed without micro-approval. Reserve questions for physical access, irreversible actions and real tradeoffs. Email requires explicit approval of final content and recipient before sending.
+## Approval boundary
+- Routine investigation, isolated fixes and tests follow a user's fix instruction without micro-approvals. No speculative flash/reset, automatic fleet updates or release promotion.
+- Physical USB test, release publication/activation and sensor-specific OTA each have distinct validation requirements; honor the exact approved workflow and retain immutable prior binaries for rollback.
+- Ask only for inaccessible physical tests, destructive operations or genuine tradeoffs. Do not invent provenance, test evidence or live status.
+- Email requires explicit approval of the exact final recipients and content before sending.
